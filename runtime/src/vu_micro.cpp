@@ -47,7 +47,8 @@ struct Unit {
     vuops::FlagPipe *pipe = nullptr;
     // What a branch reads of the integer registers: the values from before the
     // previous instruction when that one wrote them (see BranchView).
-    const std::uint16_t *branch_vi = nullptr;
+    const std::uint16_t *branch_vi = nullptr;  // legacy VU0 view
+    const ViBranchBackup *vi_backup = nullptr;
     // FSSET waits for the upper instruction of its pair: the sticky flags it
     // sets replace those of the status that instruction writes (Metal Gear
     // Solid 3 clears them next to an OPMSUB before testing its collision
@@ -240,11 +241,12 @@ struct Decoded {
     std::uint8_t target = 0, dest = 0, fs = 0, ft = 0, bc = 0, frac = 0;
     bool flags = false;
     VfUse use;
+    unsigned vi_backup_reg;
 };
 
 Decoded g_decoded[2][2048];
 bool g_flags_used[2] = {true, true};
-// Whether anything in the unit's code memory reads a flag, the clip flags or Q: only then do the cycles of the pipeline matter.
+// Pipeline timing is observable through flags, Q, or a branch which can read a delayed VI write.
 bool g_clock_used[2] = {true, true};
 bool g_scan[2] = {true, true};
 
@@ -252,6 +254,7 @@ Decoded decode_upper(std::uint32_t lo, std::uint32_t hi) {
     Decoded d;
     d.lo = lo;
     d.hi = hi;
+    d.vi_backup_reg = vi_backup_write(lo, hi);
     d.valid = true;
     d.use = vf_use(lo, hi);
     d.dest = static_cast<std::uint8_t>((hi >> 21) & 15u);
@@ -408,12 +411,18 @@ void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
 
 void scan_flags(int unit, const std::uint8_t *code, std::uint32_t size) {
     bool used = false, clock = false;
+    unsigned branch_reads = 0, backup_writes = 0;
     for (std::uint32_t pc = 0; pc < size && !(used && clock); pc += 8) {
         std::uint32_t lo, hi;
         std::memcpy(&lo, code + pc, 4);
         std::memcpy(&hi, code + pc + 4, 4);
         if (reads_q(hi)) clock = true;
         if (hi & 0x80000000u) continue;
+        if (unit == 1 && !clock) {
+            branch_reads |= vi_branch_reads(lo, hi);
+            backup_writes |= 1u << vi_backup_write(lo, hi);
+            clock = (branch_reads & backup_writes) != 0;
+        }
         switch (lo >> 25) {
         case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: used = clock = true; break;
         case 0x10: case 0x11: case 0x12: case 0x13: case 0x1C: clock = true; break;
@@ -599,7 +608,10 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
         npc = target & u.code_mask;
         branch = true;
     };
-    const auto bvi = [&](unsigned k) -> std::uint16_t { return u.branch_vi ? u.branch_vi[k] : r.vi[k]; };
+    const auto bvi = [&](unsigned k) -> std::uint16_t {
+        if (u.vi_backup) return u.vi_backup->read(k, r.vi[k], u.pipe->t);
+        return u.branch_vi ? u.branch_vi[k] : r.vi[k];
+    };
     if ((w >> 25) == 0x40u) {
         const unsigned funct = w & 63u;
         if (funct < 0x3C) {
@@ -794,7 +806,8 @@ void set_tops(std::uint32_t top, std::uint32_t itop) {
     g_itop = itop;
 }
 
-void run_fast(int n, std::uint32_t address);
+void run_fast(int n, std::uint32_t address, const vuops::FlagPipe *paused = nullptr,
+              const ViBranchBackup *saved_backup = nullptr, const Vu1RecentWrites *writes = nullptr);
 
 std::unordered_map<std::uint64_t, ProgramFn> g_programs;
 std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
@@ -1368,16 +1381,19 @@ ProgramFn lookup(std::uint32_t address) {
     return e.function;
 }
 
-void run_fast(int n, std::uint32_t address) {
+void run_fast(int n, std::uint32_t address, const vuops::FlagPipe *paused,
+              const ViBranchBackup *saved_backup, const Vu1RecentWrites *writes) {
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
-    const bool flags = g_flags_used[n], clock = g_clock_used[n];
+    const bool flags = g_flags_used[n], clock = paused || g_clock_used[n];
     Decoded *cache = g_decoded[n];
     vuops::FlagPipe pipe;
-    pipe.start(r);
+    if (paused) pipe = *paused;
+    else pipe.start(r);
     u.pipe = &pipe;
     std::uint32_t vf_ready[32][4] = {}, vi_ready[16] = {};
+    if (writes) writes->restore(u.code, pipe.t + 1u, vf_ready, vi_ready);
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
     UpperOut out;
@@ -1385,7 +1401,8 @@ void run_fast(int n, std::uint32_t address) {
     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
     static const bool record_jumps = !ps2::os::env("PS2_VU_RECORD").empty() || static_cast<bool>(g_options.on_vu_program);
     if (count && ++calls % 20000 == 0) std::fprintf(stderr, "[vu1] %llu calls, %llu instructions\n", (unsigned long long)calls, (unsigned long long)total);
-    BranchView view;
+    ViBranchBackup backup = saved_backup ? *saved_backup : ViBranchBackup{};
+    u.vi_backup = &backup;
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps, ++total) {
         if (!(steps & 0xFFu) && halted()) return;  // the window was closed: a program that does not end must not hold the close up for seconds
         std::uint32_t lo, hi;
@@ -1407,9 +1424,7 @@ void run_fast(int n, std::uint32_t address) {
         }
         read_q(u, pipe, r, current, hi);
         fast_upper(r, d, out);
-        std::uint16_t was[16];
-        view.snapshot(r, was);
-        view.arm(u, r);
+        if (d.vi_backup_reg) backup.write(d.vi_backup_reg, r.vi[d.vi_backup_reg], pipe.t);
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
@@ -1419,8 +1434,6 @@ void run_fast(int n, std::uint32_t address) {
             if (branch) npc = target;
             if (branch && record_jumps && n == 1 && ((lo >> 25) == 0x24u || (lo >> 25) == 0x25u)) lookup(target);
         }
-        u.branch_vi = nullptr;
-        view.commit(was, lo, hi);
         if (out.target > 0) {
             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
             for (int i = 0; i < 4; ++i)
@@ -1466,6 +1479,20 @@ void run_fast(int n, std::uint32_t address) {
     }
 }
 
+void resume(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
+            const Vu1RecentWrites &writes) {
+    const std::uint32_t next = pipe.t + 1u;
+    const bool pending_mac = pipe.mh && pipe.mac_ts[(pipe.mh - 1u) & 7u] + 4u > next;
+    const bool pending_clip = pipe.ch && pipe.clip_ts[(pipe.ch - 1u) & 7u] + 4u > next;
+    if (writes.pending(next) || (backup.reg && backup.active(backup.reg, next)) || pending_mac || pending_clip ||
+        (pipe.q_pending && pipe.q_ready > next)) {
+        run_fast(1, pc, &pipe, &backup, &writes);
+        return;
+    }
+    if (pipe.q_pending) g_vu1.q = pipe.q_value;
+    interpret(1, pc);
+}
+
 void run(int n, std::uint32_t address) {
     if (n == 0) {
         static const bool report = [] {
@@ -1509,7 +1536,9 @@ void run_reference(int n, std::uint32_t address) {
     Decoded *cache = g_decoded[n];
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
-    BranchView view;
+    BranchView vu0_view;
+    ViBranchBackup backup;
+    if (n == 1) u.vi_backup = &backup;
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps) {
         if (!(steps & 0xFFu) && halted()) return;  // the window was closed: a program that does not end must not hold the close up for seconds
         std::uint32_t lo, hi;
@@ -1530,8 +1559,12 @@ void run_reference(int n, std::uint32_t address) {
         UpperOut out = upper(r, hi);
         bool branch = false;
         std::uint16_t was[16];
-        view.snapshot(r, was);
-        view.arm(u, r);
+        if (n == 0) {
+            vu0_view.snapshot(r, was);
+            vu0_view.arm(u, r);
+        } else if (const unsigned reg = vi_backup_write(lo, hi)) {
+            backup.write(reg, r.vi[reg], pipe.t);
+        }
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
@@ -1540,8 +1573,10 @@ void run_reference(int n, std::uint32_t address) {
             if (branch) npc = target;
             if (branch && n == 0 && (lo >> 25) == 0x25u) note_vu0_call(target);
         }
-        u.branch_vi = nullptr;
-        view.commit(was, lo, hi);
+        if (n == 0) {
+            u.branch_vi = nullptr;
+            vu0_view.commit(was, lo, hi);
+        }
         commit(r, out);
         if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
         if (u.fsset >= 0) {

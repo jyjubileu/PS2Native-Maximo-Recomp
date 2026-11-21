@@ -548,6 +548,7 @@ std::string local_vi(std::string o) {
     o.insert(body, declare);
     if (!sync.empty()) {
         replace_all(o, "vu::interpret(", sync + "vu::interpret(");
+        replace_all(o, "vu::resume(", sync + "vu::resume(");
         replace_all(o, "r.tpc = ", sync + "r.tpc = ");
     }
     return o;
@@ -726,6 +727,26 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             }
         }
     }
+    unsigned timed_branch_reads = 0, timed_backup_writes = 0;
+    std::set<std::uint32_t> handoff_slots;
+    if (p.unit == 1) {
+        for (std::uint32_t pc : pcs) {
+            const Lower &l = lowers[pc];
+            const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+            // Unsupported pairs, including branches in delay slots, use the interpreter
+            // from the program entry. Register jumps can transfer after a supported slot.
+            if (!l.supported) return {};
+            if (l.jump) {
+                const std::uint32_t next = (pc + 8u) & kMask;
+                if (word(p.code, next + 4) & 0x40000000u) return {};
+                handoff_slots.insert(next);
+            }
+            timed_branch_reads |= ps2::vu::vi_branch_reads(lo, hi);
+            timed_backup_writes |= 1u << ps2::vu::vi_backup_write(lo, hi);
+        }
+    }
+    const bool has_handoff = !handoff_slots.empty();
+    const unsigned timed_backups = timed_branch_reads & timed_backup_writes;
     std::map<std::uint32_t, int> def;
     std::map<std::uint32_t, std::vector<std::uint32_t>> preds;
     std::set<std::uint32_t> targets;
@@ -737,10 +758,22 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         for (std::int64_t s : successors(pc))
             if (s >= 0 && in.count(static_cast<std::uint32_t>(s))) preds[static_cast<std::uint32_t>(s)].push_back(pc);
     }
+    // Retain producers within three issues of an interpreter handoff. Earlier producers
+    // cannot stall the first resumed pair, even along the shortest possible path.
+    std::set<std::uint32_t> handoff_writers = handoff_slots;
+    for (unsigned distance = 0; distance < 2; ++distance) {
+        auto nearer = handoff_writers;
+        for (std::uint32_t pc : nearer)
+            handoff_writers.insert(preds[pc].begin(), preds[pc].end());
+    }
+    const auto transfer = [&](const std::string &pc) {
+        return has_handoff ? std::format("vu::resume({}, fl, branch_backup, recent_writes); return; ", pc)
+                           : std::format("vu::interpret(1, {}); return; ", pc);
+    };
     std::map<std::uint32_t, int> delay, keep_bk;
     std::set<std::uint32_t> set_bi;
     for (std::uint32_t pc : pcs) {
-        if (!lowers[pc].branch) continue;
+        if (p.unit != 0 || !lowers[pc].branch) continue;
         const std::uint32_t lo = word(p.code, pc), op = lo >> 25, it = (lo >> 16) & 15u, is = (lo >> 11) & 15u;
         std::uint32_t reads = 0;
         if (op == 0x28 || op == 0x29) reads = (1u << is) | (1u << it);
@@ -819,7 +852,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             worth += loop ? kLoopRounds : 1;
         }
     }
-    const bool lazy = p.unit != 0 && worth >= kDazWorth;
+    const bool lazy = p.unit != 0 && !has_handoff && worth >= kDazWorth;
     bool any_arith = false;
     std::map<std::uint32_t, Effect> effect;
     std::map<std::uint32_t, Lanes> a_in, a_out, raw_live;
@@ -955,8 +988,8 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     // A VU1 program that reads no flags at all still leaves the MAC and status of its last results, as the interpreter
     // does: its live flag sites (the last ones before a way out) keep their result as the last one, every other one only adds to
     // the sticky bits (FlagPipeV::push_last, stick).
-    const bool end_flags = p.unit != 0 && !any_flags && !any_status && !any_status_low && !g_eager_flags;
-    const bool late_flags = (p.unit != 0 && any_flags && !any_status && !g_eager_flags) || end_flags;
+    const bool end_flags = p.unit != 0 && !has_handoff && !any_flags && !any_status && !any_status_low && !g_eager_flags;
+    const bool late_flags = (p.unit != 0 && !has_handoff && any_flags && !any_status && !g_eager_flags) || end_flags;
     const FlagMode flag_mode = end_flags ? kFlagsEnd : late_flags ? kFlagsLate : kFlagsEager;
     // With FlagPipeV the body is a template on kSticky, and the function the table calls runs it with kSticky false when the status
     // it starts with already has the sticky zero and sign bits (0xC0): the sticky bits of a FlagPipeV program only go from 0 to 1
@@ -966,6 +999,8 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n");
     if (p.unit == 0) o += "    std::uint32_t steps = 0;\n";
     if (dyn) o += "    const Vu0Regs saved = r;\n    std::uint8_t saved_mem[4096];\n    std::memcpy(saved_mem, mem, sizeof saved_mem);\n";
+    if (timed_backups || has_handoff) o += "    vu::ViBranchBackup branch_backup;\n";
+    if (has_handoff) o += "    vu::Vu1RecentWrites recent_writes;\n";
     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
     // An instruction whose stall depends on the path that led to it reads the pipeline state index `st` the edges set.
     const auto list = [](const std::vector<std::uint8_t> &v) {
@@ -987,10 +1022,14 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         bool out_live = false;
         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
         // A program that reads the status keeps every flag site live; elsewhere a dead site only adds to the sticky bits (upper()).
-        const bool site_live = any_status || any_status_low || out_live;
+        const bool site_live = has_handoff || any_status || any_status_low || out_live;
         const Upper u = upper(hi, site_live, p.unit == 0, flag_mode);
         const Lower &l = lowers[pc];
         std::string body;
+        if (handoff_writers.count(pc)) {
+            const auto use = ps2::vu::vf_use(lo, hi);
+            if (use.nw || use.vi_load) body += std::format("recent_writes.note({}u, fl.t); ", pc);
+        }
         if (lazy) {
             Lanes lanes{};
             for (int reg = 1; reg <= 32; ++reg) lanes[reg] = a_in[pc][reg] & effect[pc].observed[reg];
@@ -999,6 +1038,16 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         if (const auto kb = keep_bk.find(pc); kb != keep_bk.end()) body += std::format("next_bk = r.vi[{}]; ", kb->second);
         body += u.pre;
         std::string lcode = l.code;
+        if (timed_backups || has_handoff) {
+            const unsigned reg = ps2::vu::vi_backup_write(lo, hi);
+            if (reg && (has_handoff || (timed_backups & (1u << reg))))
+                body += std::format("branch_backup.write({0}u, r.vi[{0}], fl.t); ", reg);
+            const unsigned reads = timed_backups & ps2::vu::vi_branch_reads(lo, hi);
+            for (unsigned r = 1; r < 16; ++r)
+                if (reads & (1u << r))
+                    replace_all(lcode, std::format("r.vi[{}]", r),
+                                std::format("branch_backup.read({0}u, r.vi[{0}], fl.t)", r));
+        }
         if (const auto d = delay.find(pc); d != delay.end()) {
             for (int reg = 1; reg < 16; ++reg) {
                 if (d->second == 2) replace_all(lcode, std::format("r.vi[{}]", reg), std::format("(bi == {} ? bk : r.vi[{}])", reg, reg));
@@ -1067,11 +1116,11 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             }
         }
         const std::uint32_t next = (pc + 8u) & kMask;
-        if (!in.count(next)) o += std::format("    {}vu::interpret(1, {}u);\n    return;\n", leave(pc), next);
+        if (!in.count(next)) o += "    " + leave(pc) + transfer(std::to_string(next) + "u") + "\n";
         else if (const std::string e = meet(pc, next) + edge(next); !e.empty()) o += "    " + e + "\n";
     }
     if (dyn) o += std::format("bail:\n    r = saved;\n    std::memcpy(mem, saved_mem, sizeof saved_mem);\n    vu::vu0_restart({}u);\n    return;\n", p.entry & kMask);
-    o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
+    o += "dispatch:\n    " + transfer("jpc") + "\n}\n\n";
     // A FlagPipeV program with a flag site: its body becomes a template on kSticky (see above), the copy with kSticky true is called
     // through a cold function of its own (_c), so the copy that runs stays as small as the body was without the sticky work.
     const bool sticky_split = late_flags && o.find(", kSticky>(") != std::string::npos;
@@ -1131,7 +1180,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 15";
+const char *const kGeneratorVersion = "vurecomp 18";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;
@@ -1255,6 +1304,8 @@ ps2::vu::LiveHost g_host;
 
 namespace ps2::vu {{
 void interpret(int unit, std::uint32_t pc) {{ g_host.interpret(unit, pc); }}
+void resume(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
+            const Vu1RecentWrites &writes) {{ g_host.resume(pc, pipe, backup, writes); }}
 void kick(int unit, std::uint32_t address) {{ g_host.kick(unit, address); }}
 std::uint32_t top() {{ return g_host.top(); }}
 std::uint32_t itop() {{ return g_host.itop(); }}

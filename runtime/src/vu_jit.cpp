@@ -29,7 +29,7 @@ constexpr ImportType kImportTypes[kImports] = {
 };
 
 enum Local : std::uint32_t {
-    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kExit, kUclip, kTmp, kTmp2, kMacv, kStat, kSlot, kT, kSign, kExp, kBi, kBk, kBkNext, kVi0, kI32Locals = kVi0 + 16,
+    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kExit, kUclip, kTmp, kTmp2, kMacv, kStat, kSlot, kT, kSign, kExp, kBi, kBk, kBkTime, kVi0, kI32Locals = kVi0 + 16,
     kBits = kI32Locals, kUv, kV0, kV1, kV2, kV3, kV4, kV5, kShadow0
 };
 constexpr std::uint32_t kI32Count = kI32Locals - 2;
@@ -191,7 +191,7 @@ struct Code : Out {
 };
 
 enum : std::uint8_t {
-    kOpDrop = 0x1A, kOpSelect = 0x1B, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpGtS = 0x4A, kOpLeS = 0x4C, kOpGeS = 0x4E, kOpGeU = 0x4F,
+    kOpDrop = 0x1A, kOpSelect = 0x1B, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpLtU = 0x49, kOpGtS = 0x4A, kOpLeS = 0x4C, kOpGeS = 0x4E, kOpGeU = 0x4F,
     kOpAdd = 0x6A, kOpSub = 0x6B, kOpMul = 0x6C, kOpAnd = 0x71, kOpOr = 0x72, kOpXor = 0x73, kOpShl = 0x74, kOpShrU = 0x76, kOpExt16 = 0xC1, kOpBr = 0x0C,
     kOpI64Add = 0x7C, kOpI64Or = 0x84, kOpI64Shl = 0x86, kOpI64ShrU = 0x88, kOpF64Sqrt = 0x9F, kOpF64Div = 0xA3, kOpWrap = 0xA7, kOpExtendU = 0xAD,
     kOpI64FromF64 = 0xBD, kOpF64FromI64 = 0xBF,
@@ -385,13 +385,8 @@ private:
     std::map<std::uint32_t, std::uint32_t> case_of_;
     std::uint32_t cases_ = 0, case_index_ = 0;
     std::uint32_t vi_used_ = 0, vi_written_ = 0;
-    std::map<std::uint32_t, unsigned> vi_def_;
-    std::map<std::uint32_t, int> delay_;
+    unsigned backup_regs_ = 0;
     StallPlan plan_;
-    std::map<std::uint32_t, unsigned> keep_bk_;
-    std::set<std::uint32_t> set_bi_;
-    int delay_mode_ = 0;
-    unsigned delay_reg_ = 0;
     bool any_status_ = false, any_flags_ = false;
 
     std::uint32_t word(std::uint32_t at) const {
@@ -427,38 +422,6 @@ private:
             if (pl.branch && in_.count(pl.target)) s.push_back(pl.target);
         }
         return s;
-    }
-
-    unsigned vi_def(std::uint32_t pc) {
-        const std::uint32_t w = word(pc);
-        if ((word(pc + 4) & 0x80000000u) || !lowers_[pc].supported || branch_delay_exempt(w)) return 0;
-        const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 15u, is = (w >> 11) & 15u, id = (w >> 6) & 15u;
-        if ((w >> 25) == 0x40u) {
-            const unsigned funct = w & 63u;
-            if (funct < 0x3C) return funct == 0x32 ? it : (funct == 0x30 || funct == 0x31 || funct == 0x34 || funct == 0x35) ? id : 0;
-            switch (((w >> 6) & 31u) * 4u + (funct & 3u)) {
-            case 0x34: case 0x36: return is;
-            case 0x35: case 0x37: case 0x3C: case 0x68: case 0x69: return it;
-            case 0x3E: return dest ? it : 0;
-            default: return 0;
-            }
-        }
-        switch (w >> 25) {
-        case 0x04: return dest ? it : 0;
-        case 0x08: case 0x09: return it;
-        default: return 0;
-        }
-    }
-
-    std::uint32_t branch_reads(std::uint32_t pc) {
-        if (!lowers_[pc].branch) return 0;
-        const std::uint32_t w = word(pc);
-        const unsigned it = (w >> 16) & 15u, is = (w >> 11) & 15u;
-        switch (w >> 25) {
-        case 0x2C: case 0x2D: case 0x2E: case 0x2F: return (1u << is) & ~1u;
-        case 0x28: case 0x29: return ((1u << is) | (1u << it)) & ~1u;
-        default: return 0;
-        }
     }
 
     int lower_write(std::uint32_t pc) {
@@ -596,18 +559,39 @@ private:
         c_.get(kVi0 + i);
     }
 
+    void backup_active(unsigned i) {
+        c_.get(kBi);
+        c_.i32c(i);
+        c_.op(kOpEq);
+        c_.get(kT);
+        c_.get(kBkTime);
+        c_.op(kOpSub);
+        c_.i32c(kViBackupCycles);
+        c_.op(kOpLtU);
+        c_.op(kOpAnd);
+    }
+
     void branch_vi(unsigned i) {
-        if (!i || !delay_mode_ || (delay_mode_ == 1 && i != delay_reg_)) {
+        if (!(backup_regs_ & (1u << i))) {
             vi(i);
             return;
         }
         c_.get(kBk);
-        if (delay_mode_ == 1) return;
         vi(i);
-        c_.get(kBi);
-        c_.i32c(i);
-        c_.op(kOpEq);
+        backup_active(i);
         c_.op(kOpSelect);
+    }
+
+    void save_vi_backup(unsigned i) {
+        c_.get(kBk);
+        vi(i);
+        backup_active(i);
+        c_.op(kOpSelect);
+        c_.set(kBk);
+        c_.i32c(i);
+        c_.set(kBi);
+        c_.get(kT);
+        c_.set(kBkTime);
     }
 
     template <typename F>
@@ -1732,14 +1716,8 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
         else if (kind == kQDynamic) sync_q();
     }
     upper_pre(u, flags_live);
-    const unsigned def = vi_def_[pc];
-    if (const auto kb = keep_bk_.find(pc); kb != keep_bk_.end()) {
-        vi(kb->second);
-        c_.set(kBkNext);
-    }
-    const auto delay = delay_.find(pc);
-    delay_mode_ = delay == delay_.end() ? 0 : delay->second;
-    delay_reg_ = delay_mode_ == 1 ? vi_def_[(pc - 8u) & kMask] : 0;
+    const unsigned def = vi_backup_write(lo, hi);
+    if (backup_regs_ & (1u << def)) save_vi_backup(def);
     bool fsset_after = false;
     if (hi & 0x80000000u) {
         c_.get(kR);
@@ -1749,15 +1727,6 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
         leave(pc);
     } else {
         fsset_after = (lo >> 25) == 0x15;
-    }
-    delay_mode_ = 0;
-    if (keep_bk_.count(pc)) {
-        c_.get(kBkNext);
-        c_.set(kBk);
-    }
-    if (set_bi_.count(pc)) {
-        c_.i32c(def);
-        c_.set(kBi);
     }
     upper_post(u, flags_live);
     if (fsset_after) fsset(lo);
@@ -1888,14 +1857,19 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
     plan_ = stall_plan(code_, kMask, pcs_, entry_);
     if (!plan_.ok || plan_.any_tracked) return false;
     in_.insert(pcs_.begin(), pcs_.end());
+    unsigned branch_reads = 0, backup_writes = 0;
     for (std::uint32_t pc : pcs_) {
         LowerInfo l;
         if (!(word(pc + 4) & 0x80000000u)) l = analyze_lower(word(pc), pc);
-        if (branch_in_delay_slot(code_, kMask, pc)) l.supported = false;
+        // A mid-program fallback cannot transfer pending VI pipeline state.
+        if (!l.supported || l.jump || branch_in_delay_slot(code_, kMask, pc)) return false;
+        branch_reads |= vi_branch_reads(word(pc), word(pc + 4));
+        backup_writes |= 1u << vi_backup_write(word(pc), word(pc + 4));
         any_status_ = any_status_ || l.reads_status;
         any_flags_ = any_flags_ || l.reads_flags;
         lowers_[pc] = l;
     }
+    backup_regs_ = branch_reads & backup_writes;
     for (std::uint32_t pc : pcs_) live_in_[pc] = false;
     for (bool changed = true; changed;) {
         changed = false;
@@ -1923,44 +1897,6 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         if (l.branch && in_.count(l.target)) leaders.insert(l.target);
     }
     for (std::uint32_t pc : leaders) case_of_[pc] = cases_++;
-    std::map<std::uint32_t, std::vector<std::uint32_t>> preds;
-    for (std::uint32_t pc : pcs_) {
-        vi_def_[pc] = vi_def(pc);
-        for (std::uint32_t s : flow(pc)) preds[s].push_back(pc);
-    }
-    for (std::uint32_t pc : pcs_) {
-        const std::uint32_t reads = branch_reads(pc);
-        bool hit = false;
-        for (std::uint32_t p : preds[pc]) hit = hit || (vi_def_[p] && ((reads >> vi_def_[p]) & 1u));
-        if (!hit) continue;
-        const bool dynamic = case_of_.count(pc) != 0;
-        delay_[pc] = dynamic ? 2 : 1;
-        for (std::uint32_t p0 : preds[pc]) {
-            const unsigned reg = vi_def_[p0];
-            if (dynamic) set_bi_.insert(p0);
-            if (!reg || !((reads >> reg) & 1u)) continue;
-            auto walk = [&](auto &self, std::uint32_t u, int depth) -> void {
-                bool extended = false;
-                if (depth < 3) {
-                    for (std::uint32_t pred : preds[u]) {
-                        if (vi_def_[pred] == reg) {
-                            extended = true;
-                            self(self, pred, depth + 1);
-                        }
-                    }
-                }
-                if (extended) {
-                    for (std::uint32_t pred : preds[u]) {
-                        if (vi_def_[pred] != reg) keep_bk_[pred] = reg;
-                    }
-                } else {
-                    keep_bk_[u] = reg;
-                }
-            };
-            walk(walk, p0, 0);
-        }
-    }
-
     std::set<int> shadowed;
     for (std::uint32_t pc : pcs_)
         for (int reg : shadow_reads(word(pc + 4))) shadowed.insert(reg);

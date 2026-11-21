@@ -20,6 +20,8 @@
 
 #define PS2_VU_INLINE inline __attribute__((always_inline))
 
+namespace ps2::vuops { struct FlagPipe; }
+
 namespace ps2::vu {
 
 void kick(int unit, std::uint32_t address);
@@ -27,6 +29,10 @@ std::uint32_t top();
 std::uint32_t itop();
 std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains the VU1 live-library ABI.
 void interpret(int unit, std::uint32_t pc);
+struct ViBranchBackup;
+struct Vu1RecentWrites;
+void resume(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
+            const Vu1RecentWrites &writes);
 // AOT VU0 checks for a host stop at the same interval as the reference loop.
 bool stopped();
 // A compiled VU0 program that calls subroutines (vurecomp_gen.cpp, vu0_calls): the key of the program that starts at `entry` in the VU0
@@ -46,12 +52,14 @@ struct Program {
 void register_programs(const Program *programs, std::uint32_t count);
 
 // The functions of the runner that generated code calls. A library made while the game runs (runtime/src/vu_live.cpp) is not
-// linked to the runner: it gets these four in a table when it is loaded.
+// linked to the runner: it gets these callbacks in a table when it is loaded.
 struct LiveHost {
     void (*interpret)(int unit, std::uint32_t pc);
     void (*kick)(int unit, std::uint32_t address);
     std::uint32_t (*top)();
     std::uint32_t (*itop)();
+    void (*resume)(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
+                   const Vu1RecentWrites &writes);
 };
 
 inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
@@ -88,6 +96,56 @@ inline unsigned vi_written_reg(std::uint32_t lo, std::uint32_t hi) {
     default: return 0;
     }
 }
+// Only lower instructions that create a branch backup in the VI pipeline.
+inline unsigned vi_backup_write(std::uint32_t lo, std::uint32_t hi) {
+    if (hi & 0x80000000u) return 0;
+    const unsigned op = lower_major(lo);
+    if (op == 0x08 || op == 0x09) return (lo >> 16) & 15u;
+    if (op != 0x40) return 0;
+    const unsigned fn = lo & 63u;
+    if (fn < 0x3C) return vi_written_reg(lo, hi);
+    const unsigned index = ((lo >> 6) & 31u) * 4u + (fn & 3u);
+    switch (index) {
+    case 0x34: case 0x35: case 0x36: case 0x37: case 0x3C:
+        return vi_written_reg(lo, hi);
+    default:
+        return 0;
+    }
+}
+
+inline unsigned vi_branch_reads(std::uint32_t lo, std::uint32_t hi) {
+    if (hi & 0x80000000u) return 0;
+    const unsigned is = (lo >> 11) & 15u, it = (lo >> 16) & 15u;
+    switch (lower_major(lo)) {
+    case 0x28: case 0x29: return ((1u << is) | (1u << it)) & ~1u;
+    case 0x2C: case 0x2D: case 0x2E: case 0x2F: return (1u << is) & ~1u;
+    default: return 0;
+    }
+}
+
+inline constexpr std::uint32_t kViBackupCycles = 2;
+
+struct ViBranchBackup {
+    std::uint32_t written_at = 0;
+    unsigned reg = 0;
+    std::uint16_t old = 0;
+
+    bool active(unsigned operand, std::uint32_t cycle) const {
+        return reg == operand && cycle - written_at < kViBackupCycles;
+    }
+
+    void write(unsigned destination, std::uint16_t previous, std::uint32_t cycle) {
+        // A live consecutive write extends the original backup. A write after a stall begins a new one.
+        if (!active(destination, cycle)) old = previous;
+        reg = destination;
+        written_at = cycle;
+    }
+
+    std::uint16_t read(unsigned operand, std::uint16_t current, std::uint32_t cycle) const {
+        return active(operand, cycle) ? old : current;
+    }
+};
+
 inline bool is_branch(std::uint32_t lo) {
     const std::uint32_t op = lower_major(lo);
     return op == 0x20 || op == 0x21 || op == 0x24 || op == 0x25 || (op >= 0x28 && op <= 0x2F && op != 0x2A && op != 0x2B);
@@ -214,7 +272,7 @@ inline VfUse vf_use(std::uint32_t lo, std::uint32_t hi) {
     if (major == 0x01) u.read_vi(it);
     if (major == 0x04 || major == 0x05 || major == 0x28 || major == 0x29) u.read_vi(is);
     if (major == 0x05 || major == 0x28 || major == 0x29) u.read_vi(it);
-    if (major == 0x04) u.vi_load = it;
+    if (major == 0x04 && ldest) u.vi_load = it;
     if (major == 0x40 && (lo & 0x3Cu) != 0x3Cu) {
         const unsigned funct = lo & 0x3Fu;
         if (funct == 0x30 || funct == 0x31 || funct == 0x32 || funct == 0x34 || funct == 0x35) u.read_vi(is);
@@ -224,7 +282,7 @@ inline VfUse vf_use(std::uint32_t lo, std::uint32_t hi) {
         const unsigned index = ((lo >> 6) & 31u) * 4u + (lo & 3u);
         if (index == 0x34 || index == 0x36 || index == 0x3D || index == 0x3E || index == 0x3F || index == 0x6C) u.read_vi(is);
         if (index == 0x35 || index == 0x37 || index == 0x3F) u.read_vi(it);
-        if (index == 0x3E) u.vi_load = it;
+        if (index == 0x3E && ldest) u.vi_load = it;
     }
     if (major == 0x00) u.write(lft, ldest);
     else if (major == 0x01) u.read(lfs, ldest);
@@ -262,6 +320,35 @@ inline void retire(const VfUse &u, std::uint32_t cycle, std::uint32_t (&ready)[3
 // The cycle an instruction pair issues at when it may not before `cycle`. The interpreters count these cycles in
 // FlagPipe::t: the pair waits for the registers it reads (and a WAITQ or divide for the last quotient, q_ready), so a
 // result that was four cycles away when it was written can be read by the third instruction after it, or by the first.
+// VF and VI loads are available four cycles after issue. Only producers in the last three issue slots
+// can still hold up an instruction at a compiled-to-interpreter transfer.
+struct Vu1RecentWrites {
+    struct Write {
+        std::uint32_t pc = 0;
+        std::uint32_t cycle = 0;
+    };
+    Write recent[4]{};
+    unsigned count = 0;
+
+    void note(std::uint32_t pc, std::uint32_t cycle) { recent[count++ & 3u] = {pc, cycle}; }
+
+    bool pending(std::uint32_t next_cycle) const {
+        return count && next_cycle - recent[(count - 1u) & 3u].cycle < 4u;
+    }
+
+    void restore(const std::uint8_t *code, std::uint32_t next_cycle,
+                 std::uint32_t (&vf_ready)[32][4], std::uint32_t (&vi_ready)[16]) const {
+        for (unsigned i = count > 4 ? count - 4 : 0; i < count; ++i) {
+            const auto &write = recent[i & 3u];
+            if (next_cycle - write.cycle >= 4u) continue;
+            std::uint32_t lo, hi;
+            std::memcpy(&lo, code + write.pc, 4);
+            std::memcpy(&hi, code + write.pc + 4, 4);
+            retire(vf_use(lo, hi), write.cycle, vf_ready, vi_ready);
+        }
+    }
+};
+
 inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std::uint32_t (&ready)[32][4], const std::uint32_t (&vi_ready)[16], std::uint32_t q_ready) {
     cycle = issue(u, cycle, ready, vi_ready);
     return u.q_wait ? std::max(cycle, q_ready) : cycle;
