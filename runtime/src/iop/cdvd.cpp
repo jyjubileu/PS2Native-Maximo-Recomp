@@ -75,14 +75,14 @@ bool trace_cd() {
 
 std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v % 10)); }
 
-void finish_read() {
+void finish_command(std::uint32_t reason) {
     g_cd.busy = false;
     g_cd.read_sectors = 0;
     for (int id : g_cd.sync_waiters)
         if (Thread *t = thread(id)) wake(*t, 0);
     if (!g_cd.sync_waiters.empty()) reschedule();
     g_cd.sync_waiters.clear();
-    if (g_cd.callback) call_guest(g_cd.callback, 1);
+    if (g_cd.callback) call_guest(g_cd.callback, reason);
 }
 
 std::uint64_t read_cycles(std::uint32_t sectors) {
@@ -153,7 +153,11 @@ void install_cdvd() {
         std::vector<std::uint8_t> data(static_cast<std::size_t>(j.b) * disc::kSector);
         disc::read(j.a, j.b, data.data());
         for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
-        finish_read();
+        finish_command(1);
+    });
+    register_job(kJobCdSeek, [](const Job &) {
+        if (g_trace_hle) std::fprintf(stderr, "[cdvd] seek complete (reason 4)\n");
+        finish_command(4);
     });
     register_hle_library("cdvdman", 0x0101);
     def("cdvdman", 4, "sceCdInit", [](Cpu &c) { c.r[2] = 1; });
@@ -162,7 +166,22 @@ void install_cdvd() {
         if (g_trace_hle) std::fprintf(stderr, "[cdvd] read lsn %u count %u to 0x%08X\n", arg(c, 0), arg(c, 1), arg(c, 2));
         c.r[2] = start_read(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), false) ? 1u : 0u;
     });
-    def("cdvdman", 7, "sceCdSeek", [](Cpu &c) { c.r[2] = 1; });
+    // sceCdSeek is asynchronous. The callback registered with sceCdCallback
+    // must run after the seek completes (reason SCECdFuncSeek = 4).
+    def("cdvdman", 7, "sceCdSeek", [](Cpu &c) {
+        const std::uint32_t lsn = arg(c, 0);
+        if (g_cd.busy || lsn >= disc::sector_count()) {
+            if (lsn >= disc::sector_count()) g_cd.error = 0x20; // illegal sector
+            c.r[2] = 0;
+            return;
+        }
+        g_cd.busy = true;
+        g_cd.error = 0;
+        g_cd.read_sectors = 0;  // seek, not a data read
+        if (g_trace_hle) std::fprintf(stderr, "[cdvd] seek queued lsn %u\n", lsn);
+        schedule(now() + read_cycles(1), Job{kJobCdSeek, lsn});
+        c.r[2] = 1;
+    });
     def("cdvdman", 8, "sceCdGetError", [](Cpu &c) { c.r[2] = g_cd.error; });
     def("cdvdman", 10, "sceCdSearchFile", [](Cpu &c) {
         const std::string name = ram_string(arg(c, 1), 256);
@@ -262,7 +281,7 @@ void install_cdvd() {
         if (arg(c, 1)) write32(arg(c, 1), 0);
         c.r[2] = 1;
     });
-    def("cdvdman", 28, "sceCdStatus", [](Cpu &c) { c.r[2] = g_cd.busy ? 0x06u : 0x0Au; });
+    def("cdvdman", 28, "sceCdStatus", [](Cpu &c) { c.r[2] = g_cd.busy ? (g_cd.read_sectors ? 0x06u : 0x12u) : 0x0Au; });
     def("cdvdman", 37, "sceCdCallback", [](Cpu &c) { c.r[2] = g_cd.callback; g_cd.callback = arg(c, 0); });
     def("cdvdman", 38, "sceCdPause", [](Cpu &c) { c.r[2] = 1; });
     def("cdvdman", 39, "sceCdBreak", [](Cpu &c) { c.r[2] = 1; });
@@ -338,11 +357,7 @@ std::int32_t load_module(const std::string &path, const std::string &args, std::
     for (char &ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     if (lower.rfind("cdrom", 0) == 0) data = kernel::read_disc_file(path);
     if (data.empty() && lower.rfind("rom0:", 0) != 0) {
-        // one word more for the log: a file that is not on the disc (a wrong name, or an image that lacks it) is not the same problem as
-        // one that is there but has no bytes (a damaged image), and a name that is not a disc path (cdrom...) is read from nowhere
-        const auto entry = lower.rfind("cdrom", 0) == 0 ? disc::find(path) : std::nullopt;
-        const char *why = lower.rfind("cdrom", 0) != 0 ? "not a disc path" : !entry || entry->directory ? "file not found" : entry->size == 0 ? "file is empty" : "file could not be read";
-        std::fprintf(stderr, "[iop] cannot read module %s: %s\n", path.c_str(), why);
+        std::fprintf(stderr, "[iop] cannot read module %s\n", path.c_str());
     }
     return load_module_buffer(data, path, args, std::move(done));
 }

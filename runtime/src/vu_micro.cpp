@@ -1228,7 +1228,12 @@ void run_entry(int unit, std::uint32_t pc) {
             static std::uint64_t sampled = 0;
             static const bool check_vs_interpreter = std::getenv("PS2_VU_CHECK") != nullptr;
             static bool checking = false;
-            if (check_vs_interpreter && !checking && ++sampled % 64 == 0) {
+            // V26: optionally check every call to one target program entry.
+            // PS2_VU_CHECK_ENTRY=0CF0 (hex) and PS2_VU_CHECK_EVERY=1.
+            static const char *target_entry = std::getenv("PS2_VU_CHECK_ENTRY");
+            static const bool check_every = std::getenv("PS2_VU_CHECK_EVERY") != nullptr;
+            const bool entry_matches = !target_entry || ((pc & 16383u) == (std::strtoul(target_entry, nullptr, 16) & 16383u));
+            if (check_vs_interpreter && !checking && entry_matches && (check_every || ++sampled % 64 == 0)) {
                 // The interpreter is the reference: run the compiled function
                 // and, from the same state, the interpreter, and report the
                 // first registers or memory they disagree on.
@@ -1266,6 +1271,20 @@ void run_entry(int unit, std::uint32_t pc) {
                                      pc & 16383u, static_cast<unsigned long long>(checked), vf, vi,
                                      after.q != g_vu1.q || after.p != g_vu1.p || after.i != g_vu1.i || after.r != g_vu1.r,
                                      after.mac != g_vu1.mac || after.status != g_vu1.status || after.clip != g_vu1.clip, word == ~0u ? -1 : static_cast<int>(word));
+                        if (vf >= 0) {
+                            std::fprintf(stderr, "[vu-check-v26-vf] entry %04X call %llu vf%d compiled=%08X,%08X,%08X,%08X reference=%08X,%08X,%08X,%08X\n",
+                                pc & 16383u, static_cast<unsigned long long>(checked), vf,
+                                after.vf[vf].w[0], after.vf[vf].w[1], after.vf[vf].w[2], after.vf[vf].w[3],
+                                g_vu1.vf[vf].w[0], g_vu1.vf[vf].w[1], g_vu1.vf[vf].w[2], g_vu1.vf[vf].w[3]);
+                        }
+                        if (word != ~0u) {
+                            const std::uint32_t at = word & ~15u;
+                            std::fprintf(stderr, "[vu-check-v26-mem] entry %04X call %llu first_byte=%u qword=%u compiled=", pc & 16383u, static_cast<unsigned long long>(checked), word, at / 16);
+                            for (unsigned i = 0; i < 16; ++i) std::fprintf(stderr, "%02X", run_mem[at + i]);
+                            std::fprintf(stderr, " reference=");
+                            for (unsigned i = 0; i < 16; ++i) std::fprintf(stderr, "%02X", g_vu1_mem[at + i]);
+                            std::fprintf(stderr, "\n");
+                        }
                     }
                 }
                 ++checked;

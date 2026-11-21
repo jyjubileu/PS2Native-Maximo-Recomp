@@ -8,7 +8,6 @@
 
 #include "ps2/state.hpp"
 #include "ps2/pace.hpp"
-#include "ipu/ipu.hpp"
 #include "ps2/crash.hpp"
 
 #include <algorithm>
@@ -115,7 +114,6 @@ pace::Hold g_pace;
 pace::Count g_pace_count;
 std::uint64_t g_pace_until = 0;
 int g_pace_thread = 0;
-std::uint64_t g_pace_decoded = 0;  // the decoder's commands at the last refresh
 int g_pace_held = 0;  // threads in kWaitPace (a hint for on_vblank_start, counted again there)
 
 template <typename Map>
@@ -441,7 +439,6 @@ void reset() {
     g_in_handler = g_reschedule = false;
     g_pending_alarms.clear();
     g_pace.have_last = false;
-    g_pace.film_until = 0;
     g_pace_until = 0;
     g_pace_thread = 0;
     g_pace_held = 0;
@@ -573,16 +570,6 @@ void take_pending(Cpu &c) {
 
 void on_vblank_start() {
     ++g_pace_count.refreshes;
-    static const bool trace_film = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
-    if (g_pace.every > 1 || trace_film) [[unlikely]] {  // a film is playing while the video decoder is given work: no hold (pace.hpp, kFilmRefreshes)
-        const std::uint64_t decoded = ipu::decode_commands();
-        if (decoded != g_pace_decoded) {
-            if (g_pace.every > 1) g_pace.decoder(frame_count());
-            if (trace_film) std::fprintf(stderr, "[ipu] f%llu %llu decode commands\n", static_cast<unsigned long long>(frame_count()),
-                                         static_cast<unsigned long long>(decoded - g_pace_decoded));
-        }
-        g_pace_decoded = decoded;
-    }
     if (g_pace_held) [[unlikely]] pace_release();
     if (!g_vsync_flag) return;
     st32(g_vsync_flag, 1);
@@ -631,38 +618,10 @@ void pace_report() {
                  static_cast<unsigned long long>(n.holds), pace);
 }
 
-// What a thread is doing, in words: the end-of-run list (dump) and the F9 report (thread_report) both use this. Not running: which
-// semaphore (with its count) or sleep it waits on, and for a semaphore the RPC call (server, function) that has no reply yet, if one
-// is known to use it.
-static std::string state_words(const Thread &t) {
-    char b[120];
-    if (t.status == kDormant) return "not started";
-    if (t.status == kRun) return "running";
-    if (t.status == kReady) return "ready (waits for the processor)";
-    if (t.status == kSuspend) return "suspended";
-    if (t.wait == kWaitPace) return "ready (held back a moment by the picture pace)";
-    std::string out;
-    if (t.wait == kWaitSema) {
-        const auto it = g_semas.find(t.wait_id);
-        if (it == g_semas.end()) std::snprintf(b, sizeof b, "waits on semaphore %d (gone)", t.wait_id);
-        else std::snprintf(b, sizeof b, "waits on semaphore %d (count %d, %zu waiting)", t.wait_id, it->second.count, it->second.waiters.size());
-        out = b;
-        const std::string rpc = sif::rpc_call_of_ee_semaphore(t.wait_id);
-        if (!rpc.empty()) out += "; " + rpc;
-    } else if (t.wait == kWaitSleep) {
-        out = "asleep (SleepThread: waits for a wake-up)";
-    } else {
-        std::snprintf(b, sizeof b, "waits (kind %d, id %d)", static_cast<int>(t.wait), t.wait_id);
-        out = b;
-    }
-    if (t.status == kWaitSuspend) out += ", and is suspended";
-    return out;
-}
-
 void dump() {
     for (const auto &[id, t] : g_threads) {
-        std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X (%s)\n", id, t.status, t.priority, t.wait, t.wait_id,
-                     id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0], state_words(t).c_str());
+        std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
+                     id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0]);
         const std::uint32_t sp = id == g_current ? g_cpu.r[29].w[0] : t.context.r[29].w[0];
         std::fprintf(stderr, "[thread]   stack:");
         for (std::uint32_t i = 0; i < 512 && sp + i * 4 < kRamSize; ++i) {
@@ -673,50 +632,6 @@ void dump() {
     }
     for (const auto &[id, s] : g_semas)
         if (!s.waiters.empty()) std::fprintf(stderr, "[sema] %d count %d waiters %zu\n", id, s.count, s.waiters.size());
-}
-
-// The F9 report's thread list: one plain line, then a line per thread that has started. Reads only. Called by the
-// emulation thread between two instructions, like a quick save; the window must not call it (the maps are not locked).
-std::string thread_summary() {
-    int live = 0, waiting = 0;
-    std::string who;
-    int shown = 0;
-    for (const auto &[id, t] : g_threads) {
-        if (t.status == kDormant) continue;
-        ++live;
-        const bool waits = (t.status == kWait || t.status == kWaitSuspend) && t.wait != kWaitPace;
-        if (!waits) continue;
-        ++waiting;
-        if (++shown > 6) continue;
-        std::string w = state_words(t);
-        w = w.substr(0, w.find(';'));  // the RPC part belongs to the thread lines, not to this one
-        if (w.rfind("waits on ", 0) == 0) w.replace(0, 9, "on ");
-        else if (w.rfind("asleep", 0) == 0) w = "asleep";
-        who += (who.empty() ? "" : ", ") + (id == 1 ? std::string("main thread ") : "thread " + std::to_string(id) + " ") + w;
-    }
-    if (!live) return "no EE thread has started yet";
-    if (waiting == live) return "every EE thread waits: " + who + (shown > 6 ? ", and " + std::to_string(shown - 6) + " more" : std::string());
-    return std::to_string(live - waiting) + " of " + std::to_string(live) + " EE threads run or are ready, " + std::to_string(waiting) + " wait";
-}
-
-std::string thread_report() {
-    std::string out;
-    char b[200];
-    int dormant = 0;
-    for (const auto &[id, t] : g_threads) {
-        if (t.status == kDormant) {
-            ++dormant;
-            continue;
-        }
-        const std::uint32_t pc = (id == g_current ? g_cpu.pc : t.context.pc) & ~kUnwind;  // bit 0 of the running pc is the dispatcher's flag
-        std::snprintf(b, sizeof b, "    EE thread %d%s, priority %d: ", id, id == 1 ? " (main)" : "", t.priority);
-        out += b;
-        out += state_words(t);
-        std::snprintf(b, sizeof b, "; at 0x%08X, entry 0x%08X\n", pc, t.entry);
-        out += b;
-    }
-    if (dormant) out += "    (EE threads that exist but are not started: " + std::to_string(dormant) + ")\n";
-    return out;
 }
 
 void handle_syscall(Cpu &c, std::uint32_t pc) {

@@ -69,6 +69,7 @@ enum JobKind : std::uint32_t {
     kJobFsvIopRead,
     kJobSifDmaCallback,
     kJobSifReply,
+    kJobCdSeek,
     kJobCount
 };
 struct Job {
@@ -112,7 +113,6 @@ struct Module {
     std::uint32_t base, size, entry, gp;
 };
 const std::map<int, Module> &modules();
-std::string wait_words(const Thread &t);  // what a thread does or waits for, in words (libs.cpp)
 using HleModuleStart = std::function<void()>;
 void register_hle_module(const std::string &name, HleModuleStart start);
 
