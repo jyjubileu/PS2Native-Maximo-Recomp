@@ -1,0 +1,724 @@
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -20,6 +20,8 @@
+ 
+ #define PS2_VU_INLINE inline __attribute__((always_inline))
+ 
++namespace ps2::vuops { struct FlagPipe; }
++
+ namespace ps2::vu {
+ 
+ void kick(int unit, std::uint32_t address);
+@@ -27,6 +29,10 @@
+ std::uint32_t itop();
+ std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains the VU1 live-library ABI.
+ void interpret(int unit, std::uint32_t pc);
++struct ViBranchBackup;
++struct Vu1RecentWrites;
++void resume(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
++            const Vu1RecentWrites &writes);
+ // AOT VU0 checks for a host stop at the same interval as the reference loop.
+ bool stopped();
+ // A compiled VU0 program that calls subroutines (vurecomp_gen.cpp, vu0_calls): the key of the program that starts at `entry` in the VU0
+@@ -46,12 +52,14 @@
+ void register_programs(const Program *programs, std::uint32_t count);
+ 
+ // The functions of the runner that generated code calls. A library made while the game runs (runtime/src/vu_live.cpp) is not
+-// linked to the runner: it gets these four in a table when it is loaded.
++// linked to the runner: it gets these callbacks in a table when it is loaded.
+ struct LiveHost {
+     void (*interpret)(int unit, std::uint32_t pc);
+     void (*kick)(int unit, std::uint32_t address);
+     std::uint32_t (*top)();
+     std::uint32_t (*itop)();
++    void (*resume)(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
++                   const Vu1RecentWrites &writes);
+ };
+ 
+ inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
+@@ -88,6 +96,56 @@
+     default: return 0;
+     }
+ }
++// Only lower instructions that create a branch backup in the VI pipeline.
++inline unsigned vi_backup_write(std::uint32_t lo, std::uint32_t hi) {
++    if (hi & 0x80000000u) return 0;
++    const unsigned op = lower_major(lo);
++    if (op == 0x08 || op == 0x09) return (lo >> 16) & 15u;
++    if (op != 0x40) return 0;
++    const unsigned fn = lo & 63u;
++    if (fn < 0x3C) return vi_written_reg(lo, hi);
++    const unsigned index = ((lo >> 6) & 31u) * 4u + (fn & 3u);
++    switch (index) {
++    case 0x34: case 0x35: case 0x36: case 0x37: case 0x3C:
++        return vi_written_reg(lo, hi);
++    default:
++        return 0;
++    }
++}
++
++inline unsigned vi_branch_reads(std::uint32_t lo, std::uint32_t hi) {
++    if (hi & 0x80000000u) return 0;
++    const unsigned is = (lo >> 11) & 15u, it = (lo >> 16) & 15u;
++    switch (lower_major(lo)) {
++    case 0x28: case 0x29: return ((1u << is) | (1u << it)) & ~1u;
++    case 0x2C: case 0x2D: case 0x2E: case 0x2F: return (1u << is) & ~1u;
++    default: return 0;
++    }
++}
++
++inline constexpr std::uint32_t kViBackupCycles = 2;
++
++struct ViBranchBackup {
++    std::uint32_t written_at = 0;
++    unsigned reg = 0;
++    std::uint16_t old = 0;
++
++    bool active(unsigned operand, std::uint32_t cycle) const {
++        return reg == operand && cycle - written_at < kViBackupCycles;
++    }
++
++    void write(unsigned destination, std::uint16_t previous, std::uint32_t cycle) {
++        // A live consecutive write extends the original backup. A write after a stall begins a new one.
++        if (!active(destination, cycle)) old = previous;
++        reg = destination;
++        written_at = cycle;
++    }
++
++    std::uint16_t read(unsigned operand, std::uint16_t current, std::uint32_t cycle) const {
++        return active(operand, cycle) ? old : current;
++    }
++};
++
+ inline bool is_branch(std::uint32_t lo) {
+     const std::uint32_t op = lower_major(lo);
+     return op == 0x20 || op == 0x21 || op == 0x24 || op == 0x25 || (op >= 0x28 && op <= 0x2F && op != 0x2A && op != 0x2B);
+@@ -214,7 +272,7 @@
+     if (major == 0x01) u.read_vi(it);
+     if (major == 0x04 || major == 0x05 || major == 0x28 || major == 0x29) u.read_vi(is);
+     if (major == 0x05 || major == 0x28 || major == 0x29) u.read_vi(it);
+-    if (major == 0x04) u.vi_load = it;
++    if (major == 0x04 && ldest) u.vi_load = it;
+     if (major == 0x40 && (lo & 0x3Cu) != 0x3Cu) {
+         const unsigned funct = lo & 0x3Fu;
+         if (funct == 0x30 || funct == 0x31 || funct == 0x32 || funct == 0x34 || funct == 0x35) u.read_vi(is);
+@@ -224,7 +282,7 @@
+         const unsigned index = ((lo >> 6) & 31u) * 4u + (lo & 3u);
+         if (index == 0x34 || index == 0x36 || index == 0x3D || index == 0x3E || index == 0x3F || index == 0x6C) u.read_vi(is);
+         if (index == 0x35 || index == 0x37 || index == 0x3F) u.read_vi(it);
+-        if (index == 0x3E) u.vi_load = it;
++        if (index == 0x3E && ldest) u.vi_load = it;
+     }
+     if (major == 0x00) u.write(lft, ldest);
+     else if (major == 0x01) u.read(lfs, ldest);
+@@ -262,6 +320,35 @@
+ // The cycle an instruction pair issues at when it may not before `cycle`. The interpreters count these cycles in
+ // FlagPipe::t: the pair waits for the registers it reads (and a WAITQ or divide for the last quotient, q_ready), so a
+ // result that was four cycles away when it was written can be read by the third instruction after it, or by the first.
++// VF and VI loads are available four cycles after issue. Only producers in the last three issue slots
++// can still hold up an instruction at a compiled-to-interpreter transfer.
++struct Vu1RecentWrites {
++    struct Write {
++        std::uint32_t pc = 0;
++        std::uint32_t cycle = 0;
++    };
++    Write recent[4]{};
++    unsigned count = 0;
++
++    void note(std::uint32_t pc, std::uint32_t cycle) { recent[count++ & 3u] = {pc, cycle}; }
++
++    bool pending(std::uint32_t next_cycle) const {
++        return count && next_cycle - recent[(count - 1u) & 3u].cycle < 4u;
++    }
++
++    void restore(const std::uint8_t *code, std::uint32_t next_cycle,
++                 std::uint32_t (&vf_ready)[32][4], std::uint32_t (&vi_ready)[16]) const {
++        for (unsigned i = count > 4 ? count - 4 : 0; i < count; ++i) {
++            const auto &write = recent[i & 3u];
++            if (next_cycle - write.cycle >= 4u) continue;
++            std::uint32_t lo, hi;
++            std::memcpy(&lo, code + write.pc, 4);
++            std::memcpy(&hi, code + write.pc + 4, 4);
++            retire(vf_use(lo, hi), write.cycle, vf_ready, vi_ready);
++        }
++    }
++};
++
+ inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std::uint32_t (&ready)[32][4], const std::uint32_t (&vi_ready)[16], std::uint32_t q_ready) {
+     cycle = issue(u, cycle, ready, vi_ready);
+     return u.q_wait ? std::max(cycle, q_ready) : cycle;
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -47,7 +47,8 @@
+     vuops::FlagPipe *pipe = nullptr;
+     // What a branch reads of the integer registers: the values from before the
+     // previous instruction when that one wrote them (see BranchView).
+-    const std::uint16_t *branch_vi = nullptr;
++    const std::uint16_t *branch_vi = nullptr;  // legacy VU0 view
++    const ViBranchBackup *vi_backup = nullptr;
+     // FSSET waits for the upper instruction of its pair: the sticky flags it
+     // sets replace those of the status that instruction writes (Metal Gear
+     // Solid 3 clears them next to an OPMSUB before testing its collision
+@@ -240,11 +241,12 @@
+     std::uint8_t target = 0, dest = 0, fs = 0, ft = 0, bc = 0, frac = 0;
+     bool flags = false;
+     VfUse use;
++    unsigned vi_backup_reg;
+ };
+ 
+ Decoded g_decoded[2][2048];
+ bool g_flags_used[2] = {true, true};
+-// Whether anything in the unit's code memory reads a flag, the clip flags or Q: only then do the cycles of the pipeline matter.
++// Pipeline timing is observable through flags, Q, or a branch which can read a delayed VI write.
+ bool g_clock_used[2] = {true, true};
+ bool g_scan[2] = {true, true};
+ 
+@@ -252,6 +254,7 @@
+     Decoded d;
+     d.lo = lo;
+     d.hi = hi;
++    d.vi_backup_reg = vi_backup_write(lo, hi);
+     d.valid = true;
+     d.use = vf_use(lo, hi);
+     d.dest = static_cast<std::uint8_t>((hi >> 21) & 15u);
+@@ -408,12 +411,18 @@
+ 
+ void scan_flags(int unit, const std::uint8_t *code, std::uint32_t size) {
+     bool used = false, clock = false;
++    unsigned branch_reads = 0, backup_writes = 0;
+     for (std::uint32_t pc = 0; pc < size && !(used && clock); pc += 8) {
+         std::uint32_t lo, hi;
+         std::memcpy(&lo, code + pc, 4);
+         std::memcpy(&hi, code + pc + 4, 4);
+         if (reads_q(hi)) clock = true;
+         if (hi & 0x80000000u) continue;
++        if (unit == 1 && !clock) {
++            branch_reads |= vi_branch_reads(lo, hi);
++            backup_writes |= 1u << vi_backup_write(lo, hi);
++            clock = (branch_reads & backup_writes) != 0;
++        }
+         switch (lo >> 25) {
+         case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: used = clock = true; break;
+         case 0x10: case 0x11: case 0x12: case 0x13: case 0x1C: clock = true; break;
+@@ -599,7 +608,10 @@
+         npc = target & u.code_mask;
+         branch = true;
+     };
+-    const auto bvi = [&](unsigned k) -> std::uint16_t { return u.branch_vi ? u.branch_vi[k] : r.vi[k]; };
++    const auto bvi = [&](unsigned k) -> std::uint16_t {
++        if (u.vi_backup) return u.vi_backup->read(k, r.vi[k], u.pipe->t);
++        return u.branch_vi ? u.branch_vi[k] : r.vi[k];
++    };
+     if ((w >> 25) == 0x40u) {
+         const unsigned funct = w & 63u;
+         if (funct < 0x3C) {
+@@ -794,7 +806,8 @@
+     g_itop = itop;
+ }
+ 
+-void run_fast(int n, std::uint32_t address);
++void run_fast(int n, std::uint32_t address, const vuops::FlagPipe *paused = nullptr,
++              const ViBranchBackup *saved_backup = nullptr, const Vu1RecentWrites *writes = nullptr);
+ 
+ std::unordered_map<std::uint64_t, ProgramFn> g_programs;
+ std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
+@@ -1368,16 +1381,19 @@
+     return e.function;
+ }
+ 
+-void run_fast(int n, std::uint32_t address) {
++void run_fast(int n, std::uint32_t address, const vuops::FlagPipe *paused,
++              const ViBranchBackup *saved_backup, const Vu1RecentWrites *writes) {
+     Unit u = unit_of(n);
+     Vu0Regs &r = *u.regs;
+     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
+-    const bool flags = g_flags_used[n], clock = g_clock_used[n];
++    const bool flags = g_flags_used[n], clock = paused || g_clock_used[n];
+     Decoded *cache = g_decoded[n];
+     vuops::FlagPipe pipe;
+-    pipe.start(r);
++    if (paused) pipe = *paused;
++    else pipe.start(r);
+     u.pipe = &pipe;
+     std::uint32_t vf_ready[32][4] = {}, vi_ready[16] = {};
++    if (writes) writes->restore(u.code, pipe.t + 1u, vf_ready, vi_ready);
+     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
+     bool ending = false;
+     UpperOut out;
+@@ -1385,7 +1401,8 @@
+     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
+     static const bool record_jumps = !ps2::os::env("PS2_VU_RECORD").empty() || static_cast<bool>(g_options.on_vu_program);
+     if (count && ++calls % 20000 == 0) std::fprintf(stderr, "[vu1] %llu calls, %llu instructions\n", (unsigned long long)calls, (unsigned long long)total);
+-    BranchView view;
++    ViBranchBackup backup = saved_backup ? *saved_backup : ViBranchBackup{};
++    u.vi_backup = &backup;
+     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps, ++total) {
+         if (!(steps & 0xFFu) && halted()) return;  // the window was closed: a program that does not end must not hold the close up for seconds
+         std::uint32_t lo, hi;
+@@ -1407,9 +1424,7 @@
+         }
+         read_q(u, pipe, r, current, hi);
+         fast_upper(r, d, out);
+-        std::uint16_t was[16];
+-        view.snapshot(r, was);
+-        view.arm(u, r);
++        if (d.vi_backup_reg) backup.write(d.vi_backup_reg, r.vi[d.vi_backup_reg], pipe.t);
+         if (hi & 0x80000000u) {
+             r.i = lo;
+         } else {
+@@ -1419,8 +1434,6 @@
+             if (branch) npc = target;
+             if (branch && record_jumps && n == 1 && ((lo >> 25) == 0x24u || (lo >> 25) == 0x25u)) lookup(target);
+         }
+-        u.branch_vi = nullptr;
+-        view.commit(was, lo, hi);
+         if (out.target > 0) {
+             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
+             for (int i = 0; i < 4; ++i)
+@@ -1464,6 +1477,20 @@
+         }
+         std::fprintf(stderr, "\n");
+     }
++}
++
++void resume(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
++            const Vu1RecentWrites &writes) {
++    const std::uint32_t next = pipe.t + 1u;
++    const bool pending_mac = pipe.mh && pipe.mac_ts[(pipe.mh - 1u) & 7u] + 4u > next;
++    const bool pending_clip = pipe.ch && pipe.clip_ts[(pipe.ch - 1u) & 7u] + 4u > next;
++    if (writes.pending(next) || (backup.reg && backup.active(backup.reg, next)) || pending_mac || pending_clip ||
++        (pipe.q_pending && pipe.q_ready > next)) {
++        run_fast(1, pc, &pipe, &backup, &writes);
++        return;
++    }
++    if (pipe.q_pending) g_vu1.q = pipe.q_value;
++    interpret(1, pc);
+ }
+ 
+ void run(int n, std::uint32_t address) {
+@@ -1509,7 +1536,9 @@
+     Decoded *cache = g_decoded[n];
+     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
+     bool ending = false;
+-    BranchView view;
++    BranchView vu0_view;
++    ViBranchBackup backup;
++    if (n == 1) u.vi_backup = &backup;
+     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps) {
+         if (!(steps & 0xFFu) && halted()) return;  // the window was closed: a program that does not end must not hold the close up for seconds
+         std::uint32_t lo, hi;
+@@ -1530,8 +1559,12 @@
+         UpperOut out = upper(r, hi);
+         bool branch = false;
+         std::uint16_t was[16];
+-        view.snapshot(r, was);
+-        view.arm(u, r);
++        if (n == 0) {
++            vu0_view.snapshot(r, was);
++            vu0_view.arm(u, r);
++        } else if (const unsigned reg = vi_backup_write(lo, hi)) {
++            backup.write(reg, r.vi[reg], pipe.t);
++        }
+         if (hi & 0x80000000u) {
+             r.i = lo;
+         } else {
+@@ -1540,8 +1573,10 @@
+             if (branch) npc = target;
+             if (branch && n == 0 && (lo >> 25) == 0x25u) note_vu0_call(target);
+         }
+-        u.branch_vi = nullptr;
+-        view.commit(was, lo, hi);
++        if (n == 0) {
++            u.branch_vi = nullptr;
++            vu0_view.commit(was, lo, hi);
++        }
+         commit(r, out);
+         if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
+         if (u.fsset >= 0) {
+--- a/runtime/src/vu_jit.cpp
++++ b/runtime/src/vu_jit.cpp
+@@ -29,7 +29,7 @@
+ };
+ 
+ enum Local : std::uint32_t {
+-    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kExit, kUclip, kTmp, kTmp2, kMacv, kStat, kSlot, kT, kSign, kExp, kBi, kBk, kBkNext, kVi0, kI32Locals = kVi0 + 16,
++    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kExit, kUclip, kTmp, kTmp2, kMacv, kStat, kSlot, kT, kSign, kExp, kBi, kBk, kBkTime, kVi0, kI32Locals = kVi0 + 16,
+     kBits = kI32Locals, kUv, kV0, kV1, kV2, kV3, kV4, kV5, kShadow0
+ };
+ constexpr std::uint32_t kI32Count = kI32Locals - 2;
+@@ -191,7 +191,7 @@
+ };
+ 
+ enum : std::uint8_t {
+-    kOpDrop = 0x1A, kOpSelect = 0x1B, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpGtS = 0x4A, kOpLeS = 0x4C, kOpGeS = 0x4E, kOpGeU = 0x4F,
++    kOpDrop = 0x1A, kOpSelect = 0x1B, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpLtU = 0x49, kOpGtS = 0x4A, kOpLeS = 0x4C, kOpGeS = 0x4E, kOpGeU = 0x4F,
+     kOpAdd = 0x6A, kOpSub = 0x6B, kOpMul = 0x6C, kOpAnd = 0x71, kOpOr = 0x72, kOpXor = 0x73, kOpShl = 0x74, kOpShrU = 0x76, kOpExt16 = 0xC1, kOpBr = 0x0C,
+     kOpI64Add = 0x7C, kOpI64Or = 0x84, kOpI64Shl = 0x86, kOpI64ShrU = 0x88, kOpF64Sqrt = 0x9F, kOpF64Div = 0xA3, kOpWrap = 0xA7, kOpExtendU = 0xAD,
+     kOpI64FromF64 = 0xBD, kOpF64FromI64 = 0xBF,
+@@ -385,13 +385,8 @@
+     std::map<std::uint32_t, std::uint32_t> case_of_;
+     std::uint32_t cases_ = 0, case_index_ = 0;
+     std::uint32_t vi_used_ = 0, vi_written_ = 0;
+-    std::map<std::uint32_t, unsigned> vi_def_;
+-    std::map<std::uint32_t, int> delay_;
++    unsigned backup_regs_ = 0;
+     StallPlan plan_;
+-    std::map<std::uint32_t, unsigned> keep_bk_;
+-    std::set<std::uint32_t> set_bi_;
+-    int delay_mode_ = 0;
+-    unsigned delay_reg_ = 0;
+     bool any_status_ = false, any_flags_ = false;
+ 
+     std::uint32_t word(std::uint32_t at) const {
+@@ -427,38 +422,6 @@
+             if (pl.branch && in_.count(pl.target)) s.push_back(pl.target);
+         }
+         return s;
+-    }
+-
+-    unsigned vi_def(std::uint32_t pc) {
+-        const std::uint32_t w = word(pc);
+-        if ((word(pc + 4) & 0x80000000u) || !lowers_[pc].supported || branch_delay_exempt(w)) return 0;
+-        const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 15u, is = (w >> 11) & 15u, id = (w >> 6) & 15u;
+-        if ((w >> 25) == 0x40u) {
+-            const unsigned funct = w & 63u;
+-            if (funct < 0x3C) return funct == 0x32 ? it : (funct == 0x30 || funct == 0x31 || funct == 0x34 || funct == 0x35) ? id : 0;
+-            switch (((w >> 6) & 31u) * 4u + (funct & 3u)) {
+-            case 0x34: case 0x36: return is;
+-            case 0x35: case 0x37: case 0x3C: case 0x68: case 0x69: return it;
+-            case 0x3E: return dest ? it : 0;
+-            default: return 0;
+-            }
+-        }
+-        switch (w >> 25) {
+-        case 0x04: return dest ? it : 0;
+-        case 0x08: case 0x09: return it;
+-        default: return 0;
+-        }
+-    }
+-
+-    std::uint32_t branch_reads(std::uint32_t pc) {
+-        if (!lowers_[pc].branch) return 0;
+-        const std::uint32_t w = word(pc);
+-        const unsigned it = (w >> 16) & 15u, is = (w >> 11) & 15u;
+-        switch (w >> 25) {
+-        case 0x2C: case 0x2D: case 0x2E: case 0x2F: return (1u << is) & ~1u;
+-        case 0x28: case 0x29: return ((1u << is) | (1u << it)) & ~1u;
+-        default: return 0;
+-        }
+     }
+ 
+     int lower_write(std::uint32_t pc) {
+@@ -596,18 +559,39 @@
+         c_.get(kVi0 + i);
+     }
+ 
+-    void branch_vi(unsigned i) {
+-        if (!i || !delay_mode_ || (delay_mode_ == 1 && i != delay_reg_)) {
+-            vi(i);
+-            return;
+-        }
+-        c_.get(kBk);
+-        if (delay_mode_ == 1) return;
+-        vi(i);
++    void backup_active(unsigned i) {
+         c_.get(kBi);
+         c_.i32c(i);
+         c_.op(kOpEq);
++        c_.get(kT);
++        c_.get(kBkTime);
++        c_.op(kOpSub);
++        c_.i32c(kViBackupCycles);
++        c_.op(kOpLtU);
++        c_.op(kOpAnd);
++    }
++
++    void branch_vi(unsigned i) {
++        if (!(backup_regs_ & (1u << i))) {
++            vi(i);
++            return;
++        }
++        c_.get(kBk);
++        vi(i);
++        backup_active(i);
+         c_.op(kOpSelect);
++    }
++
++    void save_vi_backup(unsigned i) {
++        c_.get(kBk);
++        vi(i);
++        backup_active(i);
++        c_.op(kOpSelect);
++        c_.set(kBk);
++        c_.i32c(i);
++        c_.set(kBi);
++        c_.get(kT);
++        c_.set(kBkTime);
+     }
+ 
+     template <typename F>
+@@ -1732,14 +1716,8 @@
+         else if (kind == kQDynamic) sync_q();
+     }
+     upper_pre(u, flags_live);
+-    const unsigned def = vi_def_[pc];
+-    if (const auto kb = keep_bk_.find(pc); kb != keep_bk_.end()) {
+-        vi(kb->second);
+-        c_.set(kBkNext);
+-    }
+-    const auto delay = delay_.find(pc);
+-    delay_mode_ = delay == delay_.end() ? 0 : delay->second;
+-    delay_reg_ = delay_mode_ == 1 ? vi_def_[(pc - 8u) & kMask] : 0;
++    const unsigned def = vi_backup_write(lo, hi);
++    if (backup_regs_ & (1u << def)) save_vi_backup(def);
+     bool fsset_after = false;
+     if (hi & 0x80000000u) {
+         c_.get(kR);
+@@ -1749,15 +1727,6 @@
+         leave(pc);
+     } else {
+         fsset_after = (lo >> 25) == 0x15;
+-    }
+-    delay_mode_ = 0;
+-    if (keep_bk_.count(pc)) {
+-        c_.get(kBkNext);
+-        c_.set(kBk);
+-    }
+-    if (set_bi_.count(pc)) {
+-        c_.i32c(def);
+-        c_.set(kBi);
+     }
+     upper_post(u, flags_live);
+     if (fsset_after) fsset(lo);
+@@ -1888,14 +1857,19 @@
+     plan_ = stall_plan(code_, kMask, pcs_, entry_);
+     if (!plan_.ok || plan_.any_tracked) return false;
+     in_.insert(pcs_.begin(), pcs_.end());
++    unsigned branch_reads = 0, backup_writes = 0;
+     for (std::uint32_t pc : pcs_) {
+         LowerInfo l;
+         if (!(word(pc + 4) & 0x80000000u)) l = analyze_lower(word(pc), pc);
+-        if (branch_in_delay_slot(code_, kMask, pc)) l.supported = false;
++        // A mid-program fallback cannot transfer pending VI pipeline state.
++        if (!l.supported || l.jump || branch_in_delay_slot(code_, kMask, pc)) return false;
++        branch_reads |= vi_branch_reads(word(pc), word(pc + 4));
++        backup_writes |= 1u << vi_backup_write(word(pc), word(pc + 4));
+         any_status_ = any_status_ || l.reads_status;
+         any_flags_ = any_flags_ || l.reads_flags;
+         lowers_[pc] = l;
+     }
++    backup_regs_ = branch_reads & backup_writes;
+     for (std::uint32_t pc : pcs_) live_in_[pc] = false;
+     for (bool changed = true; changed;) {
+         changed = false;
+@@ -1923,44 +1897,6 @@
+         if (l.branch && in_.count(l.target)) leaders.insert(l.target);
+     }
+     for (std::uint32_t pc : leaders) case_of_[pc] = cases_++;
+-    std::map<std::uint32_t, std::vector<std::uint32_t>> preds;
+-    for (std::uint32_t pc : pcs_) {
+-        vi_def_[pc] = vi_def(pc);
+-        for (std::uint32_t s : flow(pc)) preds[s].push_back(pc);
+-    }
+-    for (std::uint32_t pc : pcs_) {
+-        const std::uint32_t reads = branch_reads(pc);
+-        bool hit = false;
+-        for (std::uint32_t p : preds[pc]) hit = hit || (vi_def_[p] && ((reads >> vi_def_[p]) & 1u));
+-        if (!hit) continue;
+-        const bool dynamic = case_of_.count(pc) != 0;
+-        delay_[pc] = dynamic ? 2 : 1;
+-        for (std::uint32_t p0 : preds[pc]) {
+-            const unsigned reg = vi_def_[p0];
+-            if (dynamic) set_bi_.insert(p0);
+-            if (!reg || !((reads >> reg) & 1u)) continue;
+-            auto walk = [&](auto &self, std::uint32_t u, int depth) -> void {
+-                bool extended = false;
+-                if (depth < 3) {
+-                    for (std::uint32_t pred : preds[u]) {
+-                        if (vi_def_[pred] == reg) {
+-                            extended = true;
+-                            self(self, pred, depth + 1);
+-                        }
+-                    }
+-                }
+-                if (extended) {
+-                    for (std::uint32_t pred : preds[u]) {
+-                        if (vi_def_[pred] != reg) keep_bk_[pred] = reg;
+-                    }
+-                } else {
+-                    keep_bk_[u] = reg;
+-                }
+-            };
+-            walk(walk, p0, 0);
+-        }
+-    }
+-
+     std::set<int> shadowed;
+     for (std::uint32_t pc : pcs_)
+         for (int reg : shadow_reads(word(pc + 4))) shadowed.insert(reg);
+--- a/runtime/src/vu_live.cpp
++++ b/runtime/src/vu_live.cpp
+@@ -115,7 +115,7 @@
+     const auto init = reinterpret_cast<InitFn>(lb::find_symbol(library, "ps2_vu_live_init"));
+     if (!stamp || !init || stamp() != g->stamp) return false;  // stays loaded: it cannot be unloaded safely, and it is rare
+     crash::note_live_library(crash::Thread::LiveVu, reinterpret_cast<const void *>(init));  // a crash in it is named as live VU code
+-    static const LiveHost host = {&ps2::vu::interpret, &ps2::vu::kick, &ps2::vu::top, &ps2::vu::itop};
++    static const LiveHost host = {&ps2::vu::interpret, &ps2::vu::kick, &ps2::vu::top, &ps2::vu::itop, &ps2::vu::resume};
+     std::uint32_t n = 0;
+     const Program *table = init(&host, &n);
+     std::lock_guard lock(g->mutex);
+--- a/recomp/vurecomp_gen.cpp
++++ b/recomp/vurecomp_gen.cpp
+@@ -548,6 +548,7 @@
+     o.insert(body, declare);
+     if (!sync.empty()) {
+         replace_all(o, "vu::interpret(", sync + "vu::interpret(");
++        replace_all(o, "vu::resume(", sync + "vu::resume(");
+         replace_all(o, "r.tpc = ", sync + "r.tpc = ");
+     }
+     return o;
+@@ -726,6 +727,26 @@
+             }
+         }
+     }
++    unsigned timed_branch_reads = 0, timed_backup_writes = 0;
++    std::set<std::uint32_t> handoff_slots;
++    if (p.unit == 1) {
++        for (std::uint32_t pc : pcs) {
++            const Lower &l = lowers[pc];
++            const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
++            // Unsupported pairs, including branches in delay slots, use the interpreter
++            // from the program entry. Register jumps can transfer after a supported slot.
++            if (!l.supported) return {};
++            if (l.jump) {
++                const std::uint32_t next = (pc + 8u) & kMask;
++                if (word(p.code, next + 4) & 0x40000000u) return {};
++                handoff_slots.insert(next);
++            }
++            timed_branch_reads |= ps2::vu::vi_branch_reads(lo, hi);
++            timed_backup_writes |= 1u << ps2::vu::vi_backup_write(lo, hi);
++        }
++    }
++    const bool has_handoff = !handoff_slots.empty();
++    const unsigned timed_backups = timed_branch_reads & timed_backup_writes;
+     std::map<std::uint32_t, int> def;
+     std::map<std::uint32_t, std::vector<std::uint32_t>> preds;
+     std::set<std::uint32_t> targets;
+@@ -737,10 +758,22 @@
+         for (std::int64_t s : successors(pc))
+             if (s >= 0 && in.count(static_cast<std::uint32_t>(s))) preds[static_cast<std::uint32_t>(s)].push_back(pc);
+     }
++    // Retain producers within three issues of an interpreter handoff. Earlier producers
++    // cannot stall the first resumed pair, even along the shortest possible path.
++    std::set<std::uint32_t> handoff_writers = handoff_slots;
++    for (unsigned distance = 0; distance < 2; ++distance) {
++        auto nearer = handoff_writers;
++        for (std::uint32_t pc : nearer)
++            handoff_writers.insert(preds[pc].begin(), preds[pc].end());
++    }
++    const auto transfer = [&](const std::string &pc) {
++        return has_handoff ? std::format("vu::resume({}, fl, branch_backup, recent_writes); return; ", pc)
++                           : std::format("vu::interpret(1, {}); return; ", pc);
++    };
+     std::map<std::uint32_t, int> delay, keep_bk;
+     std::set<std::uint32_t> set_bi;
+     for (std::uint32_t pc : pcs) {
+-        if (!lowers[pc].branch) continue;
++        if (p.unit != 0 || !lowers[pc].branch) continue;
+         const std::uint32_t lo = word(p.code, pc), op = lo >> 25, it = (lo >> 16) & 15u, is = (lo >> 11) & 15u;
+         std::uint32_t reads = 0;
+         if (op == 0x28 || op == 0x29) reads = (1u << is) | (1u << it);
+@@ -819,7 +852,7 @@
+             worth += loop ? kLoopRounds : 1;
+         }
+     }
+-    const bool lazy = p.unit != 0 && worth >= kDazWorth;
++    const bool lazy = p.unit != 0 && !has_handoff && worth >= kDazWorth;
+     bool any_arith = false;
+     std::map<std::uint32_t, Effect> effect;
+     std::map<std::uint32_t, Lanes> a_in, a_out, raw_live;
+@@ -955,8 +988,8 @@
+     // A VU1 program that reads no flags at all still leaves the MAC and status of its last results, as the interpreter
+     // does: its live flag sites (the last ones before a way out) keep their result as the last one, every other one only adds to
+     // the sticky bits (FlagPipeV::push_last, stick).
+-    const bool end_flags = p.unit != 0 && !any_flags && !any_status && !any_status_low && !g_eager_flags;
+-    const bool late_flags = (p.unit != 0 && any_flags && !any_status && !g_eager_flags) || end_flags;
++    const bool end_flags = p.unit != 0 && !has_handoff && !any_flags && !any_status && !any_status_low && !g_eager_flags;
++    const bool late_flags = (p.unit != 0 && !has_handoff && any_flags && !any_status && !g_eager_flags) || end_flags;
+     const FlagMode flag_mode = end_flags ? kFlagsEnd : late_flags ? kFlagsLate : kFlagsEager;
+     // With FlagPipeV the body is a template on kSticky, and the function the table calls runs it with kSticky false when the status
+     // it starts with already has the sticky zero and sign bits (0xC0): the sticky bits of a FlagPipeV program only go from 0 to 1
+@@ -966,6 +999,8 @@
+     std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n");
+     if (p.unit == 0) o += "    std::uint32_t steps = 0;\n";
+     if (dyn) o += "    const Vu0Regs saved = r;\n    std::uint8_t saved_mem[4096];\n    std::memcpy(saved_mem, mem, sizeof saved_mem);\n";
++    if (timed_backups || has_handoff) o += "    vu::ViBranchBackup branch_backup;\n";
++    if (has_handoff) o += "    vu::Vu1RecentWrites recent_writes;\n";
+     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
+     // An instruction whose stall depends on the path that led to it reads the pipeline state index `st` the edges set.
+     const auto list = [](const std::vector<std::uint8_t> &v) {
+@@ -987,10 +1022,14 @@
+         bool out_live = false;
+         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
+         // A program that reads the status keeps every flag site live; elsewhere a dead site only adds to the sticky bits (upper()).
+-        const bool site_live = any_status || any_status_low || out_live;
++        const bool site_live = has_handoff || any_status || any_status_low || out_live;
+         const Upper u = upper(hi, site_live, p.unit == 0, flag_mode);
+         const Lower &l = lowers[pc];
+         std::string body;
++        if (handoff_writers.count(pc)) {
++            const auto use = ps2::vu::vf_use(lo, hi);
++            if (use.nw || use.vi_load) body += std::format("recent_writes.note({}u, fl.t); ", pc);
++        }
+         if (lazy) {
+             Lanes lanes{};
+             for (int reg = 1; reg <= 32; ++reg) lanes[reg] = a_in[pc][reg] & effect[pc].observed[reg];
+@@ -999,6 +1038,16 @@
+         if (const auto kb = keep_bk.find(pc); kb != keep_bk.end()) body += std::format("next_bk = r.vi[{}]; ", kb->second);
+         body += u.pre;
+         std::string lcode = l.code;
++        if (timed_backups || has_handoff) {
++            const unsigned reg = ps2::vu::vi_backup_write(lo, hi);
++            if (reg && (has_handoff || (timed_backups & (1u << reg))))
++                body += std::format("branch_backup.write({0}u, r.vi[{0}], fl.t); ", reg);
++            const unsigned reads = timed_backups & ps2::vu::vi_branch_reads(lo, hi);
++            for (unsigned r = 1; r < 16; ++r)
++                if (reads & (1u << r))
++                    replace_all(lcode, std::format("r.vi[{}]", r),
++                                std::format("branch_backup.read({0}u, r.vi[{0}], fl.t)", r));
++        }
+         if (const auto d = delay.find(pc); d != delay.end()) {
+             for (int reg = 1; reg < 16; ++reg) {
+                 if (d->second == 2) replace_all(lcode, std::format("r.vi[{}]", reg), std::format("(bi == {} ? bk : r.vi[{}])", reg, reg));
+@@ -1067,11 +1116,11 @@
+             }
+         }
+         const std::uint32_t next = (pc + 8u) & kMask;
+-        if (!in.count(next)) o += std::format("    {}vu::interpret(1, {}u);\n    return;\n", leave(pc), next);
++        if (!in.count(next)) o += "    " + leave(pc) + transfer(std::to_string(next) + "u") + "\n";
+         else if (const std::string e = meet(pc, next) + edge(next); !e.empty()) o += "    " + e + "\n";
+     }
+     if (dyn) o += std::format("bail:\n    r = saved;\n    std::memcpy(mem, saved_mem, sizeof saved_mem);\n    vu::vu0_restart({}u);\n    return;\n", p.entry & kMask);
+-    o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
++    o += "dispatch:\n    " + transfer("jpc") + "\n}\n\n";
+     // A FlagPipeV program with a flag site: its body becomes a template on kSticky (see above), the copy with kSticky true is called
+     // through a cold function of its own (_c), so the copy that runs stays as small as the body was without the sticky work.
+     const bool sticky_split = late_flags && o.find(", kSticky>(") != std::string::npos;
+@@ -1131,7 +1180,7 @@
+ 
+ // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
+ // are then left alone and built again (vu_live.cpp).
+-const char *const kGeneratorVersion = "vurecomp 15";
++const char *const kGeneratorVersion = "vurecomp 18";
+ 
+ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
+     std::vector<Program> programs;
+@@ -1255,6 +1304,8 @@
+ 
+ namespace ps2::vu {{
+ void interpret(int unit, std::uint32_t pc) {{ g_host.interpret(unit, pc); }}
++void resume(std::uint32_t pc, const vuops::FlagPipe &pipe, const ViBranchBackup &backup,
++            const Vu1RecentWrites &writes) {{ g_host.resume(pc, pipe, backup, writes); }}
+ void kick(int unit, std::uint32_t address) {{ g_host.kick(unit, address); }}
+ std::uint32_t top() {{ return g_host.top(); }}
+ std::uint32_t itop() {{ return g_host.itop(); }}

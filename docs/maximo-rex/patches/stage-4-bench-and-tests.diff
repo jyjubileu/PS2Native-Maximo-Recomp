@@ -1,0 +1,146 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -469,14 +469,15 @@
+ endif()
+ 
+ if(PS2_GENERATED)
+-    file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
+-    add_library(ps2game STATIC ${PS2_UNITS})
+-    # a unit that crashed the compiler is built with lower optimisation (scripts/build_units.sh); no list, no change
+-    include("${CMAKE_SOURCE_DIR}/cmake/lowopt.cmake")
+-    ps2_lowopt_apply(ps2game)
+-    target_include_directories(ps2game PRIVATE "${PS2_GENERATED}")
+-    target_link_libraries(ps2game PUBLIC ps2runtime)
+-    target_compile_options(ps2game PRIVATE -Wno-unused-label -Wno-unused-variable)
++    add_library(ps2game STATIC IMPORTED)
++    set_target_properties(ps2game PROPERTIES IMPORTED_LOCATION "${PS2_GENERATED}")
++    set(PS2_NEW_VU_DIR "" CACHE PATH "Regenerated VU programs for the isolated runner")
++    if(PS2_NEW_VU_DIR)
++        file(GLOB PS2_NEW_VU CONFIGURE_DEPENDS "${PS2_NEW_VU_DIR}/vu1_*.cpp")
++        add_library(ps2vu_game OBJECT ${PS2_NEW_VU})
++        target_include_directories(ps2vu_game PRIVATE runtime/include)
++        target_compile_options(ps2vu_game PRIVATE -Wno-unused-label -Wno-unused-variable)
++    endif()
+ 
+     if(EMSCRIPTEN)
+         set(PS2_WEB_ELF "" CACHE FILEPATH "Game executable preloaded as /game/core.elf")
+@@ -499,6 +500,9 @@
+     endif()
+ 
+     add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log
++    if(TARGET ps2vu_game)
++        target_sources(ps2run PRIVATE $<TARGET_OBJECTS:ps2vu_game>)
++    endif()
+     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
+     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+         target_sources(ps2run PRIVATE host/profile.cpp)
+@@ -554,3 +558,16 @@
+         target_link_libraries(ps2padtest PRIVATE ps2runtime SDL2::SDL2)
+     endif()
+ endif()
++
++set(PS2_VI_TEST_GENERATED "" CACHE PATH "VU generator output for the branch regression")
++add_executable(ps2vibranchtest EXCLUDE_FROM_ALL tests/vi_branch_case.cpp)
++target_include_directories(ps2vibranchtest PRIVATE runtime/src)
++target_link_libraries(ps2vibranchtest PRIVATE ps2runtime)
++if(PS2_VI_TEST_GENERATED)
++    file(GLOB PS2_VI_TEST_UNITS CONFIGURE_DEPENDS "${PS2_VI_TEST_GENERATED}/vu1_*.cpp")
++    target_sources(ps2vibranchtest PRIVATE ${PS2_VI_TEST_UNITS})
++    target_compile_definitions(ps2vibranchtest PRIVATE PS2_TEST_GENERATED_VU)
++endif()
++if(WIN32)
++    target_link_libraries(ps2vibranchtest PRIVATE synchronization)
++endif()
+--- /dev/null
++++ b/tests/vi_branch_case.cpp
+@@ -0,0 +1,49 @@
++#include "hw.hpp"
++#include "vif.hpp"
++#include "vu_micro.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++#ifdef PS2_TEST_GENERATED_VU
++void register_generated_vu();
++#endif
++
++int main(int argc, char** argv) {
++#ifdef PS2_TEST_GENERATED_VU
++    register_generated_vu();
++#endif
++    if (argc < 2) {
++        std::fputs("ps2vibranchtest stream.bin [qword ...]\n", stderr);
++        return 2;
++    }
++    auto* file = std::fopen(argv[1], "rb");
++    if (!file) return 2;
++    std::vector<std::uint32_t> words;
++    for (std::uint32_t word; std::fread(&word, sizeof word, 1, file) == 1;) words.push_back(word);
++    std::fclose(file);
++    if (words.empty()) return 2;
++    ps2::vif::reset();
++    ps2::vu::reset();
++    ps2::vif::transfer_words(1, words.data(), static_cast<std::uint32_t>(words.size()));
++    ps2::vif::flush(1);
++    std::vector<unsigned> addresses{0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x45};
++    if (argc > 2) {
++        addresses.clear();
++        for (int a = 2; a < argc; ++a) {
++            char* end = nullptr;
++            const auto address = std::strtoul(argv[a], &end, 16);
++            if (!*argv[a] || *end || address >= 1024) return 2;
++            addresses.push_back(static_cast<unsigned>(address));
++        }
++    }
++    std::fprintf(stderr, "fast_interpreter_calls=%llu\n",
++                 static_cast<unsigned long long>(ps2::vu::interpreted_calls()));
++    for (unsigned address : addresses) {
++        std::printf("%03X ", address);
++        for (unsigned i = 0; i < 16; ++i) std::printf("%02x", unsigned(ps2::g_vu1_mem[address*16+i]));
++        std::putchar('\n');
++    }
++}
+--- a/tests/test_vu_regression.cpp
++++ b/tests/test_vu_regression.cpp
+@@ -9,38 +9,6 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <vector>
+-
+-namespace ps2 {
+-alignas(64) std::uint8_t g_vu0_code[4096], g_vu0_mem[4096], g_vu1_code[16384], g_vu1_mem[16384];
+-Cpu g_cpu;
+-Options g_options;
+-std::uint64_t frame_count() { return 0; }
+-bool halted() { return false; }
+-namespace vif { std::uint32_t itop(int) { return 0; } }
+-namespace gif { void transfer(int, const std::uint8_t *, std::uint32_t) {} }
+-namespace gs::queue {
+-    Ring &vu() { static Ring ring; return ring; }
+-    Role &role() { static Role r = Role::Emulation; return r; }
+-    bool vu_active() { return false; }
+-    void Ring::post(Type, std::uint32_t, std::uint32_t, const void *, std::uint32_t) {}
+-}
+-namespace vu {
+-namespace jit {
+-    bool g_dry = false;
+-    std::uint64_t g_kicks = 0, g_escape = 0;
+-    ProgramFn compile(const std::uint8_t *, std::uint32_t) { return nullptr; }
+-    int mode() { return 0; }
+-}
+-namespace live {
+-    bool g_ready = false;
+-    bool active() { return false; }
+-    void note_call(std::uint64_t) {}
+-    ProgramFn unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) { return nullptr; }
+-    bool ready() { return false; }
+-    std::vector<std::pair<std::uint64_t, ProgramFn>> take() { return {}; }
+-}
+-}
+-}
+ 
+ using namespace ps2;
+ 
