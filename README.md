@@ -97,7 +97,7 @@ Maximo Rex is an independent, unofficial research effort. Contributions help sup
 | Method | Availability |
 |---|---|
 | **GitHub Sponsors** — international contributions | Planned; the account must finish Sponsors onboarding before accepting funds |
-| **PIX** — donations in Brazil 🇧🇷 | Planned; a public payment link/QR code will be added after setup |
+| **Mercado Pago (PIX / Brazil 🇧🇷)** — voluntary contributions | **[Choose any amount](https://link.mercadopago.com.br/jyjubileu)** · Confirm Pix availability at checkout |
 
 **All donations are optional.** Donations do not buy access to the game, game files, private builds containing copyrighted content, or promised features. The project does not distribute commercial assets. Details: [support setup](docs/maximo-rex/support.md).
 
