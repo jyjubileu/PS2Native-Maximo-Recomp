@@ -1,6 +1,6 @@
 # Activate GitHub Sponsors on this account before expecting the button to work.
 github: jyjubileu
 
-# After creating a public PIX payment link, uncomment and replace with that URL.
-# Do not put CPF, personal e-mail, phone, or raw PIX keys into this file.
-# custom: "https://YOUR-PUBLIC-PIX-PAYMENT-PAGE"
+# Mercado Pago: public payment link; verify Pix and displayed recipient information before promoting.
+# Do not publish personal Pix keys, CPF, phone or e-mail here.
+custom: "https://link.mercadopago.com.br/jyjubileu"
