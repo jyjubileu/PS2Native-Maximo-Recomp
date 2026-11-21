@@ -10,38 +10,6 @@
 #include <cstring>
 #include <vector>
 
-namespace ps2 {
-alignas(64) std::uint8_t g_vu0_code[4096], g_vu0_mem[4096], g_vu1_code[16384], g_vu1_mem[16384];
-Cpu g_cpu;
-Options g_options;
-std::uint64_t frame_count() { return 0; }
-bool halted() { return false; }
-namespace vif { std::uint32_t itop(int) { return 0; } }
-namespace gif { void transfer(int, const std::uint8_t *, std::uint32_t) {} }
-namespace gs::queue {
-    Ring &vu() { static Ring ring; return ring; }
-    Role &role() { static Role r = Role::Emulation; return r; }
-    bool vu_active() { return false; }
-    void Ring::post(Type, std::uint32_t, std::uint32_t, const void *, std::uint32_t) {}
-}
-namespace vu {
-namespace jit {
-    bool g_dry = false;
-    std::uint64_t g_kicks = 0, g_escape = 0;
-    ProgramFn compile(const std::uint8_t *, std::uint32_t) { return nullptr; }
-    int mode() { return 0; }
-}
-namespace live {
-    bool g_ready = false;
-    bool active() { return false; }
-    void note_call(std::uint64_t) {}
-    ProgramFn unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) { return nullptr; }
-    bool ready() { return false; }
-    std::vector<std::pair<std::uint64_t, ProgramFn>> take() { return {}; }
-}
-}
-}
-
 using namespace ps2;
 
 int main() {
