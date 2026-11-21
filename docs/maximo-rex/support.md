@@ -9,15 +9,17 @@ The project can accept **voluntary support only after the donation destinations 
 3. Confirm https://github.com/sponsors/jyjubileu works before replacing the "Planned" entry in `README.md` with an active clickable link.
 4. `.github/FUNDING.yml` already identifies the GitHub username. GitHub displays the repository **Sponsor** button based on the file in the repository's default branch, subject to eligibility and profile status.
 
-## PIX — Brazil
+## PIX and other payment methods — Brazil
 
-1. Create a **public payment page or payment link** through a reputable Brazilian payment provider that supports PIX, ideally allowing anonymous/public-facing donation payments.
-2. Confirm the public page **does not expose a private CPF, phone number or e-mail address**.
-3. Open `.github/FUNDING.yml` and replace the commented `custom:` line with the real payment-page URL; uncomment it.
-4. Replace the PIX "Planned" entry in `README.md` with a visible link pointing to the same public page.
-5. Test both links yourself before changing repo visibility to Public.
+The public Mercado Pago payment link is: https://link.mercadopago.com.br/jyjubileu
 
-> Important: a PIX key by itself is not a web URL that GitHub can use as a `custom` donation link. Prefer a hosted payment page. Keep financial and tax records privately, following the applicable rules.
+This is a user-created **open-amount** payment link. Mercado Pago's general documentation states its "Seu link" product can accept Pix; **the available methods for this specific link must be checked in a private/incognito browser before it is promoted**.
+
+1. Open the URL in an incognito browser, not logged in to the recipient's account.
+2. Verify that the value is chosen by the supporter, that Pix is offered, and that the recipient details shown are acceptable to publish.
+3. Verify the fee and payout terms shown in the account. At setup, the account showed up to 4.99% per sale and funds in 7 days; terms may change.
+4. Never enter a raw Pix key, CPF, personal phone, banking details or tax information in the GitHub repository.
+5. If the destination or visibility needs to change, update both `.github/FUNDING.yml` and the main `README.md`.
 
 ## Legal and transparency
 
