@@ -96,7 +96,13 @@ Maximo Rex is an independent, unofficial research effort. Contributions help sup
 
 | Method | Availability |
 |---|---|
-| **GitHub Sponsors** — international contributions | Planned; the account must finish Sponsors onboarding before accepting funds |
+
+## ❤️ Support the Project
+
+If you enjoy this project and would like to support its development, consider making a donation. Every contribution is appreciated!
+
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-0070BA?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=UVULWCYZ9BVYC&no_recurring=0&currency_code=BRL)
+  
 | **Mercado Pago (PIX / Brazil 🇧🇷)** — voluntary contributions | **[Choose any amount](https://link.mercadopago.com.br/jyjubileu)** · Confirm Pix availability at checkout |
 
 **All donations are optional.** Donations do not buy access to the game, game files, private builds containing copyrighted content, or promised features. The project does not distribute commercial assets. Details: [support setup](docs/maximo-rex/support.md).
