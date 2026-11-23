@@ -94,9 +94,8 @@ Generated game-specific material stays under ignored local directories. For deta
 
 Maximo Rex is an independent, unofficial research effort. Contributions help support engineering time, testing, compatibility work and documentation.
 
-If you enjoy this project and would like to support its development, consider making a donation. **Every contribution is appreciated!**
-
-| Method | Donation link |
+| Method | Availability |
+|---|---|
 |:--|:--|
 | **PayPal** 鈥?voluntary contributions | [![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-0070BA?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=UVULWCYZ9BVYC&no_recurring=0&currency_code=BRL) |
 | **Mercado Pago (PIX / Brazil 馃嚙馃嚪)** 鈥?voluntary contributions | **[Choose any amount](https://link.mercadopago.com.br/jyjubileu)** 路 Confirm Pix availability at checkout |
