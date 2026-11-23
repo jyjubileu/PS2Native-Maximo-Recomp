@@ -1,9 +1,9 @@
 <div align="center">
 
-# 🦖 Maximo Rex
+# 馃 Maximo Rex
 ### PS2Native recompilation research for *Maximo vs. Army of Zin*
 
-**Native Windows research build · PAL `SLES_517.59` · Experimental**
+**Native Windows research build 路 PAL `SLES_517.59` 路 Experimental**
 
 ![Status: Experimental](https://img.shields.io/badge/status-experimental-orange)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue)
@@ -13,53 +13,53 @@
 A source-only engineering project focused on PS2 execution accuracy, graphics correctness,
 performance, reproducibility and widescreen gameplay.
 
-**[Compatibility](#-compatibility) · [Build](#-build-and-test) · [Engineering](#-engineering-history) · [Support](#-support-development)**
+**[Compatibility](#-compatibility) 路 [Build](#-build-and-test) 路 [Engineering](#-engineering-history) 路 [Support](#-support-development)**
 
 </div>
 
 ---
 
-## 📸 Gameplay gallery
+## 馃摳 Gameplay gallery
 
 ### Widescreen village gameplay (16:9)
 
 ![Maximo Rex running in widescreen at the village](docs/images/maximo-rex-widescreen.webp)
 
-### Level transition — *Into the Fire* (4:3)
+### Level transition 鈥?*Into the Fire* (4:3)
 
 ![Maximo Rex entering the Into the Fire level](docs/images/maximo-rex-level-transition.webp)
 
 *Screenshots captured from local test builds. On-screen FPS/monitor readings are snapshots, not performance guarantees. Game content and trademarks belong to their respective rights holders.*
 
-## ✨ Current highlights
+## 鉁?Current highlights
 
 - **VU1 timing fix:** corrects integer-register backup expiration and branch behavior shared by PS2Native's VU1 execution paths.
 - **Visible terrain correction:** the large brown polygon observed in the rainy village no longer appears in the validated comparison scenes.
 - **Aspect-ratio profiles:** 4:3 and an optional 16:9 profile using a separately supplied widescreen PNACH.
-- **Higher internal resolution:** 4× rendering demonstrated in local Direct3D 12 tests.
+- **Higher internal resolution:** 4脳 rendering demonstrated in local Direct3D 12 tests.
 - **Reproducible research:** source, synthetic regression tests, build scripts and engineering reports are tracked separately from game assets.
 
 > [!IMPORTANT]
 > **Experimental source candidate, not a finished game port.** The game is not included. Full-game compatibility, long-term performance, saves and every level have **not** been validated.
 
-## 🎮 Compatibility
+## 馃幃 Compatibility
 
 | Area | Current evidence | Status |
 |:--|:--|:--|
-| PAL 4:3 gameplay | Scripted village scenes and local manual gameplay | ✅ Observed |
-| Widescreen 16:9 | Scripted village scenes and local manual gameplay | ✅ Observed |
-| Terrain/color fix | PCSX2 differential comparisons, including 28 corrected vertex colors and 840 values in 30 packets | ✅ Validated in test scene |
-| 4× internal resolution | Fresh D3D12/DXC test captures and local manual test | ✅ Observed |
-| Level transitions | One manual 4:3 transition into *Into the Fire* reported; dedicated automated transition check pending | 🟡 Partial |
-| Audio | Running; brief buffer underruns observed in a widescreen test log | 🟡 Needs polish |
-| Full playthrough, other regions | Not established | ⚪ Untested |
-| Performance | 60 FPS observed in manual screenshots; controlled 4:3 headless AOT frame time increased 17.7% in a Stage 4 test | 🟡 Work in progress |
+| PAL 4:3 gameplay | Scripted village scenes and local manual gameplay | 鉁?Observed |
+| Widescreen 16:9 | Scripted village scenes and local manual gameplay | 鉁?Observed |
+| Terrain/color fix | PCSX2 differential comparisons, including 28 corrected vertex colors and 840 values in 30 packets | 鉁?Validated in test scene |
+| 4脳 internal resolution | Fresh D3D12/DXC test captures and local manual test | 鉁?Observed |
+| Level transitions | One manual 4:3 transition into *Into the Fire* reported; dedicated automated transition check pending | 馃煛 Partial |
+| Audio | Running; brief buffer underruns observed in a widescreen test log | 馃煛 Needs polish |
+| Full playthrough, other regions | Not established | 鈿?Untested |
+| Performance | 60 FPS observed in manual screenshots; controlled 4:3 headless AOT frame time increased 17.7% in a Stage 4 test | 馃煛 Work in progress |
 
 Fresh builds also reproduced 62 frames per aspect ratio using local checkpoints and eight reference captures byte-for-byte. The disc-only 4:3 cold run reached title, new game and the opening cinematic. These tests do **not** establish complete game compatibility.
 
 See [Stage 4 validation](docs/maximo-rex/stage-4-vi-branch-timing.md) and [publication audit](docs/maximo-rex/publication-audit.md).
 
-## 🛠️ Build and test
+## 馃洜锔?Build and test
 
 **Prerequisites:** C++20-capable Clang toolchain, CMake 3.20+, Ninja, Python 3.11+; SDL2 for the desktop window and wgpu-native for the GPU renderer and higher internal resolutions. Node.js supports optional Wasm tests. See [pinned dependencies and licenses](docs/maximo-rex/dependencies.md).
 
@@ -78,7 +78,7 @@ python scripts/build_maximo.py --profile 16x9 --disc "D:\local\maximo-pal.iso" -
 
 Generated game-specific material stays under ignored local directories. For detailed Windows build and run instructions, read [docs/maximo-rex/build.md](docs/maximo-rex/build.md).
 
-## 🔬 Engineering history
+## 馃敩 Engineering history
 
 | Stage | Investigation | Result |
 |---|---|---|
@@ -90,24 +90,20 @@ Generated game-specific material stays under ignored local directories. For deta
 **Code provenance:** [upstream revision and project history](docs/maximo-rex/provenance.md).  
 **Current research checkpoint:** `maximo-rex-stage4-candidate-1`.
 
-## ❤️ Support development
+## 鉂わ笍 Support development
 
 Maximo Rex is an independent, unofficial research effort. Contributions help support engineering time, testing, compatibility work and documentation.
 
-| Method | Availability |
-|---|---|
+If you enjoy this project and would like to support its development, consider making a donation. **Every contribution is appreciated!**
 
-## ❤️ Support the Project
-
-If you enjoy this project and would like to support its development, consider making a donation. Every contribution is appreciated!
-
-[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-0070BA?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=UVULWCYZ9BVYC&no_recurring=0&currency_code=BRL)
-  
-| **Mercado Pago (PIX / Brazil 🇧🇷)** — voluntary contributions | **[Choose any amount](https://link.mercadopago.com.br/jyjubileu)** · Confirm Pix availability at checkout |
+| Method | Donation link |
+|:--|:--|
+| **PayPal** 鈥?voluntary contributions | [![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-0070BA?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=UVULWCYZ9BVYC&no_recurring=0&currency_code=BRL) |
+| **Mercado Pago (PIX / Brazil 馃嚙馃嚪)** 鈥?voluntary contributions | **[Choose any amount](https://link.mercadopago.com.br/jyjubileu)** 路 Confirm Pix availability at checkout |
 
 **All donations are optional.** Donations do not buy access to the game, game files, private builds containing copyrighted content, or promised features. The project does not distribute commercial assets. Details: [support setup](docs/maximo-rex/support.md).
 
-## 🙏 Credits and legal notes
+## 馃檹 Credits and legal notes
 
 - **PS2Native:** [exoteric33](https://github.com/exoteric33/ps2-native-recomp) and contributors.
 - **ps2-web-recomp:** [Samir Nuri](https://github.com/snuri00/ps2-web-recomp).
