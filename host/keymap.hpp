@@ -44,12 +44,6 @@ constexpr int kLookCount = 6;
 constexpr int kDefaultLook = 5;
 const char *look_name(int look);           // "Soft + smooth edges", for the title and the key card
 const char *look_word(int look);           // the word written in keys.ini
-// keys.ini text with its 'look' line set to `look` (other lines untouched; the line is added at the end when missing)
-std::string with_look(const std::string &file_text, int look);
-// the same for the 'scale' line (the quick menu's resolution, used when the game starts the next time)
-std::string with_scale(const std::string &file_text, int scale);
-// the same for the 'sharp_2d' line (the quick menu's 2D art filter, used when the game starts the next time)
-std::string with_sharp_2d(const std::string &file_text, int sharp);
 const char *sharp_2d_word(int sharp);  // "soft", "sharp", "sharpest"
 
 const char *action_name(int action);  // the word used in keys.ini
@@ -59,8 +53,6 @@ const char *action_name(int action);  // the word used in keys.ini
 constexpr int kChangeableCount = Rage + 1;
 const char *action_label(int action);                      // "Square", "Left stick Up", "Rage (L3 + R3)"
 std::string keys_text(const Config &config, int action);   // "Left Mouse", "Space, Enter, Keypad Enter", "none"
-// keys.ini text with the line of `action` set to the keys in `config` (other lines, comments included, untouched; the line is added at the end when missing)
-std::string with_inputs(const std::string &file_text, int action, const std::vector<int> &inputs);
 // Gives `input` (a key or mouse button) to `action`, which loses the keys it had. A button that already had `input` swaps: it gets the keys
 // `action` had. Returns false and a reason in `message` when the input belongs to the program. Otherwise `message` says what happened and
 // `changed` holds every action whose keys are different now (the one asked for first).

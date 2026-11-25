@@ -40,12 +40,13 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
 bool finish_download(std::uint32_t serial);
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut);
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut);
+void reset_display_history();
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool attach_surface(const SurfaceTarget &target);
 void resize_surface(std::uint32_t width, std::uint32_t height);
 bool has_surface();
-bool present(const DisplaySource &src);
+bool present(const DisplaySource &src, const DisplayRegs &regs);
 double busy_ms();
 void stats();
 

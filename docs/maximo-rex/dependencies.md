@@ -8,6 +8,8 @@ The imported PS2Native source carries the [MIT license](../../LICENSE) and attri
 - The upstream disc toolkit retains the MAME CHD-container attribution and full [BSD 3-Clause notice](../../tools/ps2_disc_toolkit/containers.py) alongside the affected source.
 - The official upstream snapshot in the Git history includes the altered Mark Adler `puff` implementation and its zlib terms in `runtime/src/gs/gpu/gpu.cpp`. The runtime inherited by Maximo Rex uses the earlier renderer snapshot. The notice stays with the code in the upstream import.
 - PCSX2 2.9.184 was a separate test reference. The test oracles and synthesized programs in this repository are authored test data. PCSX2 source, installers, BIOS files and patch databases are external. [PCSX2 source and license](https://github.com/PCSX2/pcsx2/tree/v2.9.184)
+- SMAA 1x uses a WGSL port and the upstream lookup data. The copyright and MIT permission notice apply to the port and the locally prepared tables. [SMAA notice](../../runtime/src/gs/gpu/smaa/LICENSE.txt)
+- The Sharpen Only WGSL port of AMD FidelityFX CAS retains the AMD copyright and MIT notices. [CAS notice](../../runtime/src/gs/gpu/cas/LICENSE.txt) · [AMD implementation and attribution](../../runtime/src/gs/gpu/cas/README.md)
 
 ## Native build and test packages
 
@@ -26,3 +28,13 @@ These are the versions used in the Windows audit or pinned by the original downl
 | Git and shell tools | Git for Windows 2.56.1.windows.1 in the audit. Bash 4+ for the upstream shell build path. | The optional portable setup pins MinGit 2.56.0.2 and BusyBox FRP-6075. Their binaries and notices are distributed by their own projects. [Portable installer pins](../../scripts/portable.ps1) |
 
 The upstream `fetch_sdl2.sh`, `fetch_wgpu.sh` and `fetch_dxc.sh` scripts list the exact package digests. The browser build uses its separate Emscripten setup in the upstream scripts. This audit qualifies the native Windows runner and tests emitted Wasm VU modules in Node.js. It does not qualify a full browser build.
+
+## Prepare the local SMAA tables
+
+For a WebGPU build, place the upstream `AreaTexDX10.dds` and `SearchTex.dds` in a local folder. Use the exact upstream revision below. [Pinned SMAA textures](https://github.com/iryoku/smaa/tree/71c806a838bdd7d517df19192a20f0c61b3ca29d/Textures)
+
+```powershell
+python scripts/prepare_smaa.py .local/smaa-upstream
+```
+
+The helper verifies both input SHA-256 hashes and writes the two raw tables under ignored `.local/smaa/`. CMake verifies the resulting hashes. If you use a different destination, set `PS2_SMAA_LUT_DIR` when configuring CMake. The public checkpoint ships the shader, the preparation script and the license. Headless CPU checks can run without those tables.

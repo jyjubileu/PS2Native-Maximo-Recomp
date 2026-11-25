@@ -13,6 +13,7 @@
 #include "ps2/os.hpp"
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
+#include "ps2/video.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -558,6 +559,9 @@ void render_reset() {
     g_transfer_stale = false;
 #endif
     init();
+#ifdef PS2_GPU
+    gpu::reset_display_history();
+#endif
     std::memset(&g_state, 0, sizeof g_state);
     std::memset(g_memory, 0, sizeof g_memory);
     ++g_setup_generation;
@@ -569,6 +573,9 @@ void render_reset() {
 // A reset through CSR clears the drawing environment, not just the vertex queue,
 // as PCSX2 does: Downhill Domination's movie player leaves SCANMSK set for it.
 void soft_reset() {
+#ifdef PS2_GPU
+    gpu::reset_display_history();
+#endif
     std::uint32_t clut[512];
     std::memcpy(clut, g_state.clut, sizeof clut);
     std::memset(&g_state, 0, sizeof g_state);
@@ -1266,7 +1273,9 @@ double gpu_busy_ms() {
 #endif
 }
 
-DisplayRegs display_regs() { return DisplayRegs{g_pmode, g_smode2, {g_dispfb[0], g_dispfb[1]}, {g_display[0], g_display[1]}}; }
+DisplayRegs display_regs() {
+    return DisplayRegs{g_pmode, g_smode2, {g_dispfb[0], g_dispfb[1]}, {g_display[0], g_display[1]}, frame_count(), g_odd_field};
+}
 
 bool present() { return present(display_regs()); }
 
@@ -1281,7 +1290,7 @@ bool present(const DisplayRegs &r) {
     if (!width || !height || width > 2048 || height > 2048) return true;
     const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
                                  static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (r.smode2 & 3u) == 3u, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
-    return gpu::present(src);
+    return gpu::present(src, r);
 #else
     return false;
 #endif
@@ -1375,8 +1384,8 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
         previous = rgba;
         return true;
     }
-    static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
-    const bool blend = (r.smode2 & 3u) == 3u && !weave_off;
+    static const bool blend_disabled = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
+    const bool blend = (r.smode2 & 3u) == 3u && !blend_disabled && !(ps2::video_options() & ps2::kVideoCurrentField);
     for (std::size_t i = 0; i < rgba.size(); ++i) {
         const std::uint32_t c = rgba[i];
         if (blend) rgba[i] = (c & previous[i]) + (((c ^ previous[i]) & 0xFEFEFEFEu) >> 1);

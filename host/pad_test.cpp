@@ -10,6 +10,9 @@
 #include "iop/sio2.hpp"
 #include "ps2/system.hpp"
 #include "window.hpp"
+#include "settings.hpp"
+#include "ps2/os.hpp"
+#include "ps2/video.hpp"
 
 #include <SDL.h>
 
@@ -18,7 +21,11 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -164,11 +171,231 @@ constexpr Expect kButtons[] = {
     {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "d-pad right -> right", 5, 0},
 };
 
+void send_key(SDL_Scancode key, Uint16 modifiers = 0) {
+    SDL_Event e{};
+    e.type = SDL_KEYDOWN;
+    e.key.state = SDL_PRESSED;
+    e.key.keysym.scancode = key;
+    e.key.keysym.mod = modifiers;
+    SDL_PushEvent(&e);
+    e.type = SDL_KEYUP;
+    e.key.state = SDL_RELEASED;
+    SDL_PushEvent(&e);
+    pump();
 }
 
-int main() {
+void focus(Uint8 event) {
+    SDL_Event e{};
+    e.type = SDL_WINDOWEVENT;
+    e.window.event = event;
+    SDL_PushEvent(&e);
+    pump();
+}
+
+void tap(SDL_GameControllerButton b) {
+    button(0, b, true);
+    button(0, b, false);
+}
+
+int settings_test(const std::string &path) {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    if (!fs::create_directories(ps2::os::path(path), error)) {
+        std::fprintf(stderr, "Use a new directory for --settings.\n");
+        return 1;
+    }
+    const auto ini = path + "/rex-settings.ini", legacy = path + "/keys.ini";
+    const std::string legacy_text = "# Custom base layout\ncross = P\nmenu = F10\n";
+    std::ofstream(ps2::os::path(legacy)) << legacy_text;
+    std::ofstream(ps2::os::path(ini)) << "renderer = nonexistent\nscale = 91\nfps = maybe\npad.deadzone = 90\npad.weapon_switch = invalid\n";
+    const auto fallback = rexsettings::load(ini);
+    check(fallback.renderer == rexsettings::Renderer::automatic && !fallback.scale && !fallback.fps && !fallback.pad.deadzone &&
+          fallback.pad.weapon_switch == rexsettings::WeaponSwitch::original, "invalid values recover safe defaults");
+    const auto composition_ini = path + "/composition.ini";
+    check(rexsettings::load(composition_ini).dual_motion_fields, "a new profile defaults to dual-motion fields");
+    std::ofstream(ps2::os::path(composition_ini)) << "fps = on\n";
+    check(rexsettings::load(composition_ini).dual_motion_fields, "profiles without a composition choice use the default");
+    std::ofstream(ps2::os::path(composition_ini)) << "align_fields = on\nmotion_fields = on\n";
+    const auto legacy_composition = rexsettings::load(composition_ini);
+    check(legacy_composition.align_fields && legacy_composition.motion_fields && !legacy_composition.dual_motion_fields,
+          "the saved single-pair mode survives the new default");
+    std::ofstream(ps2::os::path(composition_ini)) << "dual_motion_fields = off\n";
+    check(!rexsettings::load(composition_ini).dual_motion_fields, "an explicit opt-out overrides the default");
+    const auto switch_path = path + "/weapon-switch-roundtrip.ini";
+    check(rexsettings::load(switch_path).pad.weapon_switch == rexsettings::WeaponSwitch::original, "missing weapon switch preference defaults to PS2");
+    std::ofstream(ps2::os::path(switch_path)) << "pad.l2_mode = radial\n";
+    auto settings = rexsettings::load(switch_path);
+    check(settings.pad.weapon_switch == rexsettings::WeaponSwitch::radial, "a 9D profile keeps radial L2");
+    std::string why;
+    check(rexsettings::save(switch_path, settings, why) && rexsettings::load(switch_path).pad.weapon_switch == rexsettings::WeaponSwitch::radial,
+          "radial L2 survives saving and loading the preferences");
+    settings.pad.weapon_switch = rexsettings::WeaponSwitch::dpad;
+    check(rexsettings::save(switch_path, settings, why) && rexsettings::load(switch_path).pad.weapon_switch == rexsettings::WeaponSwitch::dpad,
+          "D-pad mode survives saving and loading the preferences");
+    check(rexsettings::save(switch_path, fallback, why) && rexsettings::load(switch_path).pad.weapon_switch == rexsettings::WeaponSwitch::original,
+          "original L2 can be restored in the preferences");
+    SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    ps2::g_options.quick_dir = path;
+    if (!open_window(false)) return 1;
+    ps2::iop::sio2::reset();
+    pump();
+    focus(SDL_WINDOWEVENT_FOCUS_GAINED);
+    plug(0);
+    pump();
+    set_up_pad(0);
+
+    send_key(SDL_SCANCODE_F1);
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 23600);
+    button(0, SDL_CONTROLLER_BUTTON_A, true);
+    check(!buttons(poll_state(0)) && poll_state(0)[7] == 128, "F1: buttons and sticks are neutral in the menu");
+    send_key(SDL_SCANCODE_F1);
+    button(0, SDL_CONTROLLER_BUTTON_A, false);
+    check(poll_state(0)[7] == 128, "an axis held through menu closure remains blocked");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 0);
+    button(0, SDL_CONTROLLER_BUTTON_A, true);
+    check(buttons(poll_state(0)) == 1u << 14, "the first fresh input reaches the PS2 after release");
+    button(0, SDL_CONTROLLER_BUTTON_A, false);
+
+    send_key(SDL_SCANCODE_F1);
+    send_key(SDL_SCANCODE_TAB);
+    send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // dead zone
+    send_key(SDL_SCANCODE_F1);
+    check(!rexsettings::load(ini).pad.deadzone, "F1 cancels an unapplied edit");
+    send_key(SDL_SCANCODE_F1);
+    send_key(SDL_SCANCODE_TAB);
+    send_key(SDL_SCANCODE_RETURN);  // keyboard page
+    send_key(SDL_SCANCODE_RETURN);  // D-pad up
+    send_key(SDL_SCANCODE_F2);      // reserved, capture continues
+    send_key(SDL_SCANCODE_P);       // partner action Cross in the custom layout
+    send_key(SDL_SCANCODE_RETURN, KMOD_CTRL);
+    const auto after_keys = rexsettings::load(ini);
+    const auto base = keymap::defaults();
+    const auto keys = rexsettings::keyboard(after_keys, base);
+    check(keys.inputs[keymap::DpadUp] == std::vector<int>{SDL_SCANCODE_P} &&
+          keys.inputs[keymap::Cross] == std::vector<int>{SDL_SCANCODE_UP}, "keyboard tab captures and swaps conflicting keys");
+
+    send_key(SDL_SCANCODE_F1);
+    tap(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);  // Controls
+    tap(SDL_CONTROLLER_BUTTON_DPAD_DOWN);      // Gamepad
+    tap(SDL_CONTROLLER_BUTTON_A);
+    for (int i = 0; i < 14; ++i) tap(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    tap(SDL_CONTROLLER_BUTTON_A);  // capture Cross
+    tap(SDL_CONTROLLER_BUTTON_B);  // physical B moves to Cross, physical A moves to Circle
+    tap(SDL_CONTROLLER_BUTTON_Y);  // Apply
+    button(0, SDL_CONTROLLER_BUTTON_B, true);
+    check(buttons(poll_state(0)) == 1u << 14, "the remapped SDL button reaches SIO2");
+    button(0, SDL_CONTROLLER_BUTTON_B, false);
+    button(0, SDL_CONTROLLER_BUTTON_A, true);
+    check(buttons(poll_state(0)) == 1u << 13, "the gamepad conflict swaps the other binding");
+    button(0, SDL_CONTROLLER_BUTTON_A, false);
+
+    send_key(SDL_SCANCODE_F1);
+    send_key(SDL_SCANCODE_TAB);
+    for (int i = 0; i < 2; ++i) send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // 5% dead zone
+    send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // 110% sensitivity
+    send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // invert LX
+    for (int i = 0; i < 4; ++i) send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // disable rumble
+    send_key(SDL_SCANCODE_RETURN, KMOD_CTRL);
+    const auto after_pad = rexsettings::load(ini);
+    check(after_pad.pad.buttons[14] == SDL_CONTROLLER_BUTTON_B && after_pad.pad.deadzone == 5 &&
+          after_pad.pad.sensitivity == 110 && after_pad.pad.invert[0] && !after_pad.pad.rumble,
+          "gamepad map and tuning were saved together");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 1000);
+    check(poll_state(0)[7] == 128, "configured dead zone centers a small deflection");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 16384);
+    check(poll_state(0)[7] >= 58 && poll_state(0)[7] <= 64, "configured sensitivity and inversion reach SIO2");
+    poll_state(0, 1, 0xC0);
+    pump();
+    check(g_virtual[0].low == 0 && g_virtual[0].high == 0, "the rumble preference suppresses motor output");
+
+    focus(SDL_WINDOWEVENT_FOCUS_LOST);
+    check(poll_state(0)[7] == 128, "loss of focus neutralizes a moving stick");
+    focus(SDL_WINDOWEVENT_FOCUS_GAINED);
+    check(poll_state(0)[7] == 128, "refocus keeps the held stick blocked");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 0);
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 16384);
+    check(poll_state(0)[7] < 128, "a fresh deflection works after refocus");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 0);
+
+    send_key(SDL_SCANCODE_F1);
+    send_key(SDL_SCANCODE_UP);    // Apply in the footer
+    send_key(SDL_SCANCODE_RIGHT); // Defaults (wrap)
+    send_key(SDL_SCANCODE_RETURN);
+    send_key(SDL_SCANCODE_RETURN, KMOD_CTRL);
+    const auto restored = rexsettings::load(ini);
+    check(restored.default_keys && !restored.keys[keymap::DpadUp] && restored.pad.buttons[14] == SDL_CONTROLLER_BUTTON_A &&
+          restored.pad.deadzone == 0 && restored.pad.rumble && restored.scale == 1, "Defaults and Apply restore both control layouts and video");
+    send_key(SDL_SCANCODE_F1);
+    for (int i = 0; i < 7; ++i) send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // current field
+    send_key(SDL_SCANCODE_RETURN, KMOD_CTRL);
+    check(rexsettings::load(ini).current_field && (ps2::video_options() & ps2::kVideoCurrentField),
+          "the experimental field option is persisted and applied to presentation");
+    send_key(SDL_SCANCODE_F2);
+    check(ps2::video_options() & ps2::kVideoCurrentField, "F2 changes the filter without resetting field presentation");
+
+    send_key(SDL_SCANCODE_F1);
+    send_key(SDL_SCANCODE_TAB);
+    for (int i = 0; i < 9; ++i) send_key(SDL_SCANCODE_DOWN);
+    send_key(SDL_SCANCODE_RIGHT);  // left stick reference gain
+    send_key(SDL_SCANCODE_RETURN, KMOD_CTRL);
+    check(rexsettings::load(ini).pad.left_reference_gain, "left stick gain is persisted through the menu");
+
+    struct Direction { int x, y, lx, ly; };
+    for (const auto c : {Direction{0, -32768, 128, 0}, Direction{23170, -23170, 248, 7},
+                         Direction{32767, 0, 255, 128}, Direction{23170, 23170, 248, 248},
+                         Direction{0, 32767, 128, 255}, Direction{-23170, 23170, 7, 248},
+                         Direction{-32768, 0, 0, 128}, Direction{-23170, -23170, 7, 7}}) {
+        axis(0, SDL_CONTROLLER_AXIS_LEFTX, c.x);
+        axis(0, SDL_CONTROLLER_AXIS_LEFTY, c.y);
+        const auto state = poll_state(0);
+        check(state[7] == c.lx && state[8] == c.ly, "reference gain at (%d, %d): SIO2 left stick %u %u", c.x, c.y, state[7], state[8]);
+    }
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, -22272);
+    axis(0, SDL_CONTROLLER_AXIS_LEFTY, -24192);
+    const auto northwest = poll_state(0);
+    check(northwest[7] == 12 && northwest[8] == 2, "the GameSir north-west example reaches 12, 2 at SIO2");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, -8192);
+    axis(0, SDL_CONTROLLER_AXIS_LEFTY, 0);
+    axis(0, SDL_CONTROLLER_AXIS_RIGHTX, 16384);
+    const auto partial = poll_state(0);
+    check(partial[7] == 85 && partial[8] == 128 && partial[5] == 192,
+          "partially deflected left input stays analog and right input retains the original gain");
+    axis(0, SDL_CONTROLLER_AXIS_LEFTX, 0);
+    axis(0, SDL_CONTROLLER_AXIS_RIGHTX, 0);
+
+    send_key(SDL_SCANCODE_F1);
+    send_key(SDL_SCANCODE_UP);
+    send_key(SDL_SCANCODE_RIGHT);
+    send_key(SDL_SCANCODE_RETURN);
+    send_key(SDL_SCANCODE_RETURN, KMOD_CTRL);
+    const auto reset = rexsettings::load(ini);
+    check(!reset.current_field && !reset.pad.left_reference_gain && !(ps2::video_options() & ps2::kVideoCurrentField),
+          "Defaults clears the current-field override and the left-stick gain");
+    check(reset.dual_motion_fields && (ps2::video_options() & ps2::kVideoDualMotionFields), "Defaults selects dual-motion fields");
+    std::ifstream file(ps2::os::path(legacy));
+    check(std::string(std::istreambuf_iterator<char>(file), {}) == legacy_text, "legacy keys.ini remains unchanged");
+    unplug(0);
+    pump();
+    SDL_Quit();
+    std::printf("settings test: %d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
+}
+
+int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     SDL_SetMainReady();
+    if (argc == 3 && std::string_view(argv[1]) == "--settings") return settings_test(argv[2]);
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
         std::printf("SDL: %s\n", SDL_GetError());
         return 1;
@@ -231,6 +458,9 @@ int main() {
     button(0, SDL_CONTROLLER_BUTTON_A, true);
     check(buttons(poll_state(0)) == 0, "quick menu open: the game gets no button");
     button(0, SDL_CONTROLLER_BUTTON_A, false);
+    // SDL treats Guide release specially and may delay it for a short press.
+    SDL_Delay(300);
+    pump();
     button(0, SDL_CONTROLLER_BUTTON_GUIDE, true);
     button(0, SDL_CONTROLLER_BUTTON_GUIDE, false);
 

@@ -133,40 +133,13 @@ const char *look_word(int look) {
 namespace {
 // keys.ini text with its `name` line set to `line` (other lines untouched; the line is added at the end when missing). When the name
 // stands on several lines the last one is replaced, because the reader lets a later line win.
-std::string with_line(const std::string &file_text, const std::string &name, const std::string &line) {
-    std::vector<std::string> rows;
-    std::size_t pos = 0;
-    while (pos < file_text.size()) {
-        const std::size_t end = file_text.find('\n', pos);
-        rows.push_back(file_text.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
-        pos = end == std::string::npos ? file_text.size() : end + 1;
-    }
-    const bool final_newline = file_text.empty() || file_text.back() == '\n';
-    int found = -1;
-    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
-        const std::string t = trim(rows[i]);
-        const std::size_t eq = t.find('=');
-        if (eq != std::string::npos && t[0] != '#' && t[0] != ';' && squash(t.substr(0, eq)) == name) found = i;
-    }
-    if (found >= 0) rows[found] = line + (!rows[found].empty() && rows[found].back() == '\r' ? "\r" : "");
-    else rows.push_back(line);
-    std::string out;
-    for (std::size_t i = 0; i < rows.size(); ++i) out += rows[i] + (i + 1 < rows.size() || final_newline || found < 0 ? "\n" : "");
-    return out;
-}
 
 }  // namespace
-
-std::string with_look(const std::string &file_text, int look) { return with_line(file_text, "look", std::string("look = ") + look_word(look)); }
-
-std::string with_scale(const std::string &file_text, int scale) { return with_line(file_text, "scale", "scale = " + std::to_string(scale)); }
 
 const char *sharp_2d_word(int sharp) {
     static const char *const kWords[] = {"soft", "sharp", "sharpest"};
     return kWords[sharp >= 0 && sharp <= 2 ? sharp : 1];
 }
-
-std::string with_sharp_2d(const std::string &file_text, int sharp) { return with_line(file_text, "sharp2d", std::string("sharp_2d = ") + sharp_2d_word(sharp)); }
 
 bool is_reserved(int input) {
     return input == SDL_SCANCODE_F1 || input == SDL_SCANCODE_F2 || input == SDL_SCANCODE_F5 || input == SDL_SCANCODE_F8 || input == SDL_SCANCODE_F9 || input == SDL_SCANCODE_F11;
@@ -379,7 +352,7 @@ std::string default_file_text() {
         "mouse_speed = 1\n"
         "mouse_invert = off\n"
         "mouse_deadzone = 0\n"
-        "\n# How the picture is enlarged to the window (F2 in the game goes through these and writes the choice here):\n"
+        "\n# How the picture is enlarged to the window (F2 and the F1 menu save their changes in rex-settings.ini):\n"
         "#   sharp_edges   sharp, and the jagged stairs along edges are smoothed (the default)\n"
         "#   sharp         a cubic enlargement plus light sharpening: text and the health bar keep their edges\n"
         "#   crisp         hard pixels, only their borders blend\n"
@@ -452,14 +425,6 @@ std::string file_name(int input) {
 }
 
 }  // namespace
-
-std::string with_inputs(const std::string &file_text, int action, const std::vector<int> &inputs) {
-    std::string keys;
-    for (int input : inputs) keys += (keys.empty() ? "" : ", ") + file_name(input);
-    if (keys.empty()) keys = "none";
-    const std::string name = kInfo[action].name;
-    return with_line(file_text, squash(name), name + std::string(12 - std::min<std::size_t>(11, name.size()), ' ') + "= " + keys);
-}
 
 bool assign_input(Config &config, int action, int input, std::vector<int> &changed, std::string &message) {
     changed.clear();

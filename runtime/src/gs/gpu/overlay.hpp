@@ -14,4 +14,10 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
 // sends no new pictures. False when there is no window surface or no picture yet.
 bool present_again();
 
+const char *active_renderer();  // Actual GS backend, including software fallback.
+const char *active_present_mode();  // nullptr when no WebGPU surface is attached.
+bool supports_immediate_present();
+bool supports_motion_fields();
+bool supports_dual_motion_fields();
+
 }  // namespace ps2::gs::gpu

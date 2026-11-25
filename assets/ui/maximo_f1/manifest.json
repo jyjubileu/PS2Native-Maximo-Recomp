@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "format": "PNG RGBA8, straight alpha, sRGB",
+  "margins_order": ["left", "top", "right", "bottom"],
+  "composition": "Nine-slice in source pixels. Fixed corners scale with the UI; borders and center stretch. Zero margins use uniform asset scaling. Draw the selection halo before the selected row. Text is supplied by the host.",
+  "assets": [
+    {"file":"panel_main.png","width":640,"height":512,"margins":[104,104,104,104],"purpose":"Moldura externa de bronze, couro e cantos de acanto"},
+    {"file":"panel_header.png","width":768,"height":152,"margins":[140,0,140,0],"purpose":"Placa arqueada do título e do perfil"},
+    {"file":"panel_content.png","width":512,"height":352,"margins":[26,26,26,26],"purpose":"Bandeja da lista"},
+    {"file":"panel_description.png","width":512,"height":74,"margins":[34,21,34,21],"purpose":"Placa da ajuda contextual"},
+    {"file":"tab_normal.png","width":256,"height":68,"margins":[54,21,54,21],"purpose":"Aba inativa"},
+    {"file":"tab_selected.png","width":256,"height":68,"margins":[54,21,54,21],"purpose":"Aba ativa"},
+    {"file":"row_normal.png","width":512,"height":60,"margins":[24,18,24,18],"purpose":"Linha comum com separador rebaixado"},
+    {"file":"row_selected.png","width":512,"height":60,"margins":[24,18,24,18],"purpose":"Linha selecionada"},
+    {"file":"button_normal.png","width":256,"height":76,"margins":[49,23,49,23],"purpose":"Botão de repouso"},
+    {"file":"button_hover.png","width":256,"height":76,"margins":[49,23,49,23],"purpose":"Botão apontado ou ação principal"},
+    {"file":"button_pressed.png","width":256,"height":76,"margins":[49,23,49,23],"purpose":"Botão pressionado"},
+    {"file":"arrow_left.png","width":48,"height":48,"margins":[0,0,0,0],"purpose":"Reduz valor ou cicla para trás"},
+    {"file":"arrow_right.png","width":48,"height":48,"margins":[0,0,0,0],"purpose":"Aumenta valor ou cicla para frente"},
+    {"file":"scrollbar_track.png","width":26,"height":256,"margins":[0,15,0,15],"purpose":"Trilho vertical"},
+    {"file":"scrollbar_thumb.png","width":20,"height":144,"margins":[0,9,0,9],"purpose":"Indicador proporcional da rolagem"},
+    {"file":"divider_gold.png","width":512,"height":16,"margins":[24,0,24,0],"purpose":"Divisor horizontal com remates"},
+    {"file":"crest_gold.png","width":256,"height":256,"margins":[0,0,0,0],"purpose":"Medalhão heráldico"},
+    {"file":"selection_glow.png","width":512,"height":72,"margins":[32,0,32,0],"purpose":"Halo sem interior para realçar a linha"}
+  ]
+}

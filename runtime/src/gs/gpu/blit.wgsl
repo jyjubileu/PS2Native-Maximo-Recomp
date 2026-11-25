@@ -8,10 +8,17 @@ struct Blit {
     height: u32,
     current: u32,
     previous: u32,
-    blend: u32,
+    history: u32,
     out_width: u32,
     out_height: u32,
     options: u32,
+    phase: i32,
+    align_source: u32,
+    older: u32,
+    motion_history: u32,
+    oldest: u32,
+    dual_history: u32,
+    padding: vec2<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> pixels: array<u32>;
@@ -61,10 +68,52 @@ fn sample(base: u32, uv: vec2<f32>) -> vec4<f32> {
     return mix(top, bottom, f.y);
 }
 
+fn fields_aligned() -> bool {
+    return (blit.options & 16u) != 0u && blit.align_source != 0u;
+}
+
+fn uses_history() -> bool {
+    if (blit.history == 0u || (blit.options & 8u) != 0u) { return false; }
+    return !fields_aligned() || blit.phase != 0;
+}
+
+fn motion_fields() -> bool {
+    return (blit.options & 32u) != 0u && blit.motion_history != 0u;
+}
+
+fn dual_motion_fields() -> bool {
+    return (blit.options & 128u) != 0u && blit.dual_history != 0u;
+}
+
+// Compare equal parities to avoid treating fixed differences between field phases as motion.
+// In 8-bit colour codes, keep the original average through 6 and fade its history weight to zero at 24.
+fn motion_difference(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let difference = abs(a - b);
+    return max(difference.r, max(difference.g, difference.b));
+}
+
+fn motion_blend(current: vec3<f32>, previous: vec3<f32>, motion: f32) -> vec3<f32> {
+    let weight = 0.5 * (1.0 - smoothstep(6.0 / 255.0, 24.0 / 255.0, motion));
+    if (weight == 0.5) { return (current + previous) * 0.5; }
+    return mix(current, previous, weight);
+}
+
 fn scene(uv: vec2<f32>) -> vec3<f32> {
-    var c = sample(blit.current, uv).rgb;
-    if (blit.blend != 0u) { c = (c + sample(blit.previous, uv).rgb) * 0.5; }
-    return c;
+    if (!uses_history()) { return sample(blit.current, uv).rgb; }
+    if (fields_aligned()) {
+        let offset = vec2<f32>(0.0, f32(blit.phase) * 0.5 / f32(blit.height));
+        let current = sample(blit.current, uv + offset).rgb;
+        let previous = sample(blit.previous, uv - offset).rgb;
+        if (motion_fields()) {
+            var motion = motion_difference(current, sample(blit.older, uv + offset).rgb);
+            if (dual_motion_fields()) {
+                motion = max(motion, motion_difference(previous, sample(blit.oldest, uv - offset).rgb));
+            }
+            return motion_blend(current, previous, motion);
+        }
+        return (current + previous) * 0.5;
+    }
+    return (sample(blit.current, uv).rgb + sample(blit.previous, uv).rgb) * 0.5;
 }
 
 // Catmull-Rom weights (the cubic that passes through every source pixel and has a little overshoot at edges) for the four source
@@ -142,11 +191,30 @@ fn sharp_scene(uv: vec2<f32>) -> vec3<f32> {
 
 fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
 
-// The colour of one source pixel (no blending between pixels): the cheap read the edge test uses.
+// Each field moves by half the phase towards a common centre. Odd internal scales
+// require interpolation at half a texel. Clamp at the texture boundaries.
+fn phase_texel(base: u32, x: i32, y: i32, phase: i32) -> vec3<f32> {
+    let row = y + (phase >> 1u);
+    let c = texel(base, x, row).rgb;
+    if ((phase & 1) == 0) { return c; }
+    return (c + texel(base, x, row + 1).rgb) * 0.5;
+}
+
 fn scene_texel(x: i32, y: i32) -> vec3<f32> {
-    var c = texel(blit.current, x, y).rgb;
-    if (blit.blend != 0u) { c = (c + texel(blit.previous, x, y).rgb) * 0.5; }
-    return c;
+    if (!uses_history()) { return texel(blit.current, x, y).rgb; }
+    if (fields_aligned()) {
+        let current = phase_texel(blit.current, x, y, blit.phase);
+        let previous = phase_texel(blit.previous, x, y, -blit.phase);
+        if (motion_fields()) {
+            var motion = motion_difference(current, phase_texel(blit.older, x, y, blit.phase));
+            if (dual_motion_fields()) {
+                motion = max(motion, motion_difference(previous, phase_texel(blit.oldest, x, y, -blit.phase)));
+            }
+            return motion_blend(current, previous, motion);
+        }
+        return (current + previous) * 0.5;
+    }
+    return (texel(blit.current, x, y).rgb + texel(blit.previous, x, y).rgb) * 0.5;
 }
 
 fn edge_aa(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
@@ -213,17 +281,53 @@ fn reduced_scene(uv: vec2<f32>) -> vec3<f32> {
     return sum / f32(n.x * n.y);
 }
 
-@fragment
-fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+// Integrate the overlap between the destination pixel footprint and each source texel.
+// Nonnegative weights preserve constants and stay within the input colour range.
+fn area_scene(uv: vec2<f32>, size: vec2<f32>, footprint: vec2<f32>) -> vec3<f32> {
+    let centre = uv * size;
+    let begin = max(centre - 0.5 * footprint, vec2<f32>(0.0));
+    let end = min(centre + 0.5 * footprint, size);
+    let first_texel = vec2<i32>(floor(begin));
+    let past_last_texel = vec2<i32>(ceil(end));
+    var sum = vec3<f32>(0.0);
+    for (var y = first_texel.y; y < past_last_texel.y; y += 1) {
+        let wy = min(end.y, f32(y + 1)) - max(begin.y, f32(y));
+        for (var x = first_texel.x; x < past_last_texel.x; x += 1) {
+            let wx = min(end.x, f32(x + 1)) - max(begin.x, f32(x));
+            sum += scene_texel(x, y) * (wx * wy);
+        }
+    }
+    let extent = end - begin;
+    return sum / (extent.x * extent.y);
+}
+
+fn compose(uv: vec2<f32>, legacy_edges: bool) -> vec4<f32> {
     var c: vec3<f32>;
     if (blit.width > blit.out_width + blit.out_width / 16u || blit.height > blit.out_height + blit.out_height / 16u) {
-        return vec4<f32>(clamp(reduced_scene(in.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+        if ((blit.options & 64u) != 0u) {
+            let size = vec2<f32>(f32(blit.width), f32(blit.height));
+            let footprint = size / vec2<f32>(f32(blit.out_width), f32(blit.out_height));
+            if (all(footprint >= vec2<f32>(1.0)) && all(footprint <= vec2<f32>(8.0))) {
+                return vec4<f32>(clamp(area_scene(uv, size, footprint), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+            }
+        }
+        return vec4<f32>(clamp(reduced_scene(uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
     if ((blit.options & 4u) != 0u) {
-        c = sharp_scene(in.uv);
+        c = sharp_scene(uv);
     } else {
-        c = scene(in.uv);
+        c = scene(uv);
     }
-    if ((blit.options & 1u) != 0u) { c = edge_aa(in.uv, c); }
+    if (legacy_edges && (blit.options & 1u) != 0u) { c = edge_aa(uv, c); }
     return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+    return compose(in.uv, true);
+}
+
+@fragment
+fn fs_scene(in: VertexOut) -> @location(0) vec4<f32> {
+    return compose(in.uv, false);
 }

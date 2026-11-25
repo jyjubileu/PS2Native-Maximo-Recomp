@@ -24,6 +24,7 @@ python tests/vi_branch_fixture.py build/reference-continuations --continuations
 1. Put a PAL ISO made from your own copy of the game in a local folder. The helper reads `SYSTEM.CNF` and independently checks the boot ELF and CRC. The [upstream disc tools](../../docs/disc-boot.md) support more inputs.
 2. Point `--wgpu` to the extracted native package root containing `include/` and `lib/libwgpu_native.a` for GPU rendering. The default is `third_party/wgpu-native`. On Windows the helper also accepts `--sdl2` pointing to the directory containing `sdl2-config.cmake`. The project searches `third_party/sdl2` by default on Windows. On Linux, Clang needs a standard library providing C++20 `<format>`. Set `CXXFLAGS=-stdlib=libc++` if your Clang installation uses libc++.
 3. For 16:9, provide your own `SLES-51759_86E533E0.pnach` with the `Widescreen 16:9` section. The upstream helper `python scripts/pnach.py fetch <ISO> --out .local/patches` can obtain the separately maintained patch when network access is available. Inspect the file with `pnach.py sections`. Keep it local.
+4. For WebGPU, prepare the local SMAA lookup tables before running the build helper. [SMAA data setup](dependencies.md#prepare-the-local-smaa-tables)
 
 ```powershell
 $iso = 'D:\local\maximo-pal.iso'
@@ -41,6 +42,24 @@ $runnerArgs = $command[1..($command.Count - 1)]
 ```
 
 Point the same launch commands to `build/pal-16x9/runner.json` for 16:9. For 4×, set `PS2_GS=gpu` and `PS2_SCALE=4` in the launch environment. The Windows app also offers an internal-resolution setting. It needs a WebGPU-capable adapter. See the [compatibility table](../../README.md#compatibility) for the tested scope.
+
+## Checkpoint options
+
+Use a local copy of a format-compatible `.ps2` Memory Card for slot 1. To attach the card, append `--memcard` and its path to the arguments in the example above.
+
+```powershell
+& $runner @runnerArgs --window --memcard '.local/Slot1.ps2'
+```
+
+To enable the experimental PAL equipment bridge in a local SDL build, reconfigure its existing CMake directory and rebuild the runner. The build verifies the expected entry point in the locally generated EE code.
+
+```powershell
+cmake -S . -B build/pal-16x9/native -DPS2_MAXIMO_STYLE_SWITCH=ON
+cmake --build build/pal-16x9/native --target ps2run
+.\scripts\start_maximo.ps1 -Profile 16x9 -BuildDirectory build/pal-16x9
+```
+
+Open **F1 → Graphics** for field composition, FXAA, SMAA 1x and CAS. Apply updates the active display settings and persists the selection. Use **F1 → Controls** to choose the weapon-switch method in a build with the PAL bridge. To launch with the classic F1 theme, set `$env:PS2_MAXIMO_F1_THEME = 'classic'` in the launching shell. [Checkpoint and validation](checkpoint-2026-11-22.md)
 
 ## Optional local recordings
 

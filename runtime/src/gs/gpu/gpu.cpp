@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 #include "hwdraw.hpp"
 #include "overlay.hpp"
+#include "postaa.hpp"
 #include "setup.hpp"
 #include "tiles.hpp"
 #include "ps2/hitch.hpp"
@@ -19,6 +20,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -77,11 +79,23 @@ WGPUAdapter g_adapter = nullptr;
 WGPUSurface g_surface = nullptr;
 WGPUTextureFormat g_surface_format = WGPUTextureFormat_Undefined;
 WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
+bool g_immediate_present = false;
+const char *g_renderer_name = "WebGPU";
 std::uint32_t g_frame_latency = 0;  // pictures the swap chain may keep in flight; 0 = the library's default (2)
 std::uint32_t g_surface_width = 0, g_surface_height = 0;
 WGPURenderPipeline g_blit = nullptr;
+WGPURenderPipeline g_blit_scene = nullptr;
+WGPURenderPipeline g_blit_cas_scene = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
+struct alignas(16) BlitParams {
+    std::uint32_t width, height, current, previous, history, out_width, out_height, options;
+    std::int32_t phase;
+    std::uint32_t align_source;
+    std::uint32_t older, motion_history;
+    std::uint32_t oldest, dual_history;
+    std::uint32_t padding[2]{};
+};
 // The overlay (overlay.hpp): the quick menu's panel, drawn over the game's picture in the present pass with alpha blending. Its pixels
 // sit in a storage buffer like everything else here (no texture: the same code on every backend and in the browser build).
 struct Overlay {
@@ -95,10 +109,13 @@ struct Overlay {
 } g_overlay;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
+std::uint32_t g_display_history = 0;
+DisplayRegs g_previous_display{}, g_older_display{}, g_oldest_display{};
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t g_sharp_2d = 1;
+std::uint32_t g_field_slots = 2;
 
-std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
+std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field % g_field_slots) * g_field_words; }
 
 bool g_timestamps = false;
 std::uint32_t g_vendor_id = 0;  // PCI vendor id of the chosen adapter (0x8086 Intel), 0 when unknown
@@ -424,7 +441,7 @@ struct Job {
     WGPUBuffer data = nullptr, params = nullptr;
     bool measure = false, writes = false;  // writes: the job writes the arena, shape and parameter records first
     bool blit = false;                     // and before them present()'s picture parameters
-    std::uint32_t blit_words[8] = {};
+    BlitParams blit_words{};
     Arena arena;
     Words shapes;
     std::size_t shape_words = 0;
@@ -441,7 +458,7 @@ State *g_state = nullptr;  // made at the first hand-over and never freed (a det
 void drain();
 WGPUTexture g_present_texture = nullptr;  // present() sets it around submit(view): the texture the job presents and releases
 bool g_presented_async = false;           // the last submit() handed its picture over: the job presents it
-std::uint32_t g_blit[8] = {};             // present()'s picture parameters for the present pass, written by the next submit
+BlitParams g_blit{};                    // present()'s parameters, written by the next submit
 bool g_blit_pending = false;
 // 0 off, 1 everything on the submit thread, 2 the writes stay on the drawing thread. Off by default on Windows and macOS: on a laptop with Intel graphics it frees
 // the drawing thread but costs the emulation thread 1 to 2 ms a frame (two fast cores, now four busy threads), and Silent Hill 2, held by that
@@ -1840,7 +1857,7 @@ namespace post {
 // the poll; then present()'s present and releases).
 void run(Job &j) {
     const auto from = std::chrono::steady_clock::now();
-    if (j.blit) wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, j.blit_words, sizeof j.blit_words);
+    if (j.blit) wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, &j.blit_words, sizeof j.blit_words);
     j.blit = false;
     if (j.writes) {
         wgpuQueueWriteBuffer(g_queue, j.data, 0, j.arena.data(), j.arena.size() * 4);
@@ -2072,12 +2089,18 @@ void bench_capture() {
     g_bench_info.clear();
 }
 
+void draw_blit(WGPURenderPassEncoder pass, WGPURenderPipeline pipeline) {
+    wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, g_blit_group, 0, nullptr);
+    wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+}
+
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
     const auto write_blit = [] {  // present()'s parameters, when this submit does not hand them to the job
         if (!post::g_blit_pending) return;
         post::drain();
-        wt::write(g_queue, g_blit_params, 0, post::g_blit, sizeof post::g_blit);
+        wt::write(g_queue, g_blit_params, 0, &post::g_blit, sizeof post::g_blit);
         post::g_blit_pending = false;
     };
     if (g_commands.empty() && !present_view
@@ -2199,21 +2222,42 @@ void submit(WGPUTextureView present_view = nullptr) {
     if (present_view) {
         wt::Scope s(wt::kRenderPass);
         WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-        color.view = present_view;
         color.loadOp = WGPULoadOp_Clear;
         color.storeOp = WGPUStoreOp_Store;
         color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
         WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
         rd.colorAttachmentCount = 1;
         rd.colorAttachments = &color;
-        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
         const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
         const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
         const float vw = std::min(w, h * aspect), vh = vw / aspect;
-        wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
-        wgpuRenderPassEncoderSetPipeline(rp, g_blit);
-        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
-        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        const auto video = ps2::video_options();
+        const auto mode = video & kVideoSMAA ? aa::Mode::smaa : video & kVideoFXAA ? aa::Mode::fxaa : aa::Mode::off;
+        const auto cas_strength = std::min((video & kVideoCasMask) >> kVideoCasShift, 100u);
+        const auto dw = static_cast<std::uint32_t>(vw), dh = static_cast<std::uint32_t>(vh);
+        const auto compose_scene = mode == aa::Mode::off ? g_blit_cas_scene : g_blit_scene;
+        const bool filtered = compose_scene && aa::prepare(g_device, g_queue, g_surface_format, dw, dh, mode, cas_strength);
+        if (filtered) {
+            color.view = aa::scene();
+            rd.label = view("AA scene");
+            const auto scene_pass = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+            draw_blit(scene_pass, compose_scene);
+            wgpuRenderPassEncoderEnd(scene_pass);
+            wgpuRenderPassEncoderRelease(scene_pass);
+            aa::process(enc);
+        }
+        color.view = present_view;
+        rd.label = view("Present");
+        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+        if (filtered) {
+            // An integer viewport keeps the offscreen texels mapped 1:1 and leaves the bars untouched.
+            wgpuRenderPassEncoderSetViewport(rp, std::floor((w - dw) * 0.5f), std::floor((h - dh) * 0.5f),
+                                             static_cast<float>(dw), static_cast<float>(dh), 0.0f, 1.0f);
+            aa::draw(rp);
+        } else {
+            wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
+            draw_blit(rp, g_blit);
+        }
         if (g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
             // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
             const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
@@ -2235,7 +2279,10 @@ void submit(WGPUTextureView present_view = nullptr) {
         if (present_view) j.view = present_view, j.texture = post::g_present_texture;
         j.writes = post_writes;
         j.blit = post_blit;
-        if (post_blit) std::memcpy(j.blit_words, post::g_blit, sizeof post::g_blit), post::g_blit_pending = false;
+        if (post_blit) {
+            j.blit_words = post::g_blit;
+            post::g_blit_pending = false;
+        }
         if (post_writes) {
         if (wt::g_on) wt::g_bytes += (g_arena.size() + g_shapes.begin) * 4 + g_param_records.size() * kParamStride;
         // the frame's words go with the job and the drawing thread goes on with the job's emptied ones from last time
@@ -3206,12 +3253,14 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
         return give_up();
     }
     bool selected_dx12 = false;
+    const char *renderer = "WebGPU";
     g_vendor_id = 0;
     WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
         selected_dx12 = info.backendType == WGPUBackendType_D3D12;
         g_vendor_id = info.vendorID;
         const char *api = info.backendType == WGPUBackendType_Vulkan ? "Vulkan" : info.backendType == WGPUBackendType_D3D12 ? "Direct3D 12" : info.backendType == WGPUBackendType_Metal ? "Metal" : "other";
+        renderer = api;
         const bool software = info.adapterType == WGPUAdapterType_CPU;
         if (software && !software_ok)
             std::fprintf(stderr, "[gpu] %s has only a software adapter (%.*s): looking for a real graphics chip on another API first\n", name, static_cast<int>(info.device.length), info.device.data);
@@ -3250,6 +3299,7 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
         return give_up();
     }
     g_adapter = adapter;
+    g_renderer_name = renderer;
     // The requested backend mask may include DX12 even when wgpu selects Metal or Vulkan.
     g_dx12_compiler = selected_dx12 ? (dxc_dll.empty() ? "FXC" : "DXC") : nullptr;
     return true;
@@ -3357,7 +3407,16 @@ bool init(Mode m) {
     g_tables = make_buffer(tables.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     wgpuQueueWriteBuffer(g_queue, g_tables, 0, tables.data(), tables.size() * 4);
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
-    g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+    WGPULimits device_limits = WGPU_LIMITS_INIT;
+    const auto scratch_size = [](std::uint32_t slots) {
+        return (static_cast<std::uint64_t>(g_copy_words) + static_cast<std::uint64_t>(slots) * g_field_words) * 4;
+    };
+    if (m == Mode::primary && wgpuDeviceGetLimits(g_device, &device_limits) == WGPUStatus_Success) {
+        const auto limit = std::min<std::uint64_t>(device_limits.maxStorageBufferBindingSize, device_limits.maxBufferSize);
+        if (scratch_size(4) <= limit) g_field_slots = 4;
+        else if (scratch_size(3) <= limit) g_field_slots = 3;
+    }
+    g_scratch = make_buffer(scratch_size(g_field_slots), WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer((static_cast<std::uint64_t>(kCachedWords) + kDecodedWords) * 4, WGPUBufferUsage_Storage);  // the kept textures, then this submit's pictures
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
@@ -4032,11 +4091,17 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
     read_back(g_clut, kClutEntries * 4, clut.data(), static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4);
 }
 
+void reset_display_history() {
+    g_have_previous = false;
+    g_display_history = 0;
+}
+
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
     if (stat::g_on) stat::state_loaded();
     if (hwcache::g_on) hwcache::state_loaded();
     dec_reset();  // memory and palette are new: nothing kept is valid
+    reset_display_history();
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
@@ -4159,6 +4224,9 @@ bool attach_surface(const SurfaceTarget &target) {
             g_surface_format = caps.formats[i];
             break;
         }
+    g_immediate_present = false;
+    for (std::size_t i = 0; i < caps.presentModeCount; ++i)
+        g_immediate_present |= caps.presentModes[i] == WGPUPresentMode_Immediate;
     g_present_mode = WGPUPresentMode_Fifo;
     for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
         for (std::size_t i = 0; i < caps.presentModeCount; ++i)
@@ -4218,16 +4286,20 @@ bool attach_surface(const SurfaceTarget &target) {
     rd.vertex.entryPoint = view("vs");
     rd.fragment = &fragment;
     g_blit = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+    color.format = WGPUTextureFormat_RGBA8Unorm;
+    g_blit_cas_scene = g_surface_format == color.format ? g_blit : wgpuDeviceCreateRenderPipeline(g_device, &rd);
+    fragment.entryPoint = view("fs_scene");
+    g_blit_scene = wgpuDeviceCreateRenderPipeline(g_device, &rd);
     wgpuShaderModuleRelease(module);
     wgpuPipelineLayoutRelease(pipeline_layout);
-    g_blit_params = make_buffer(32, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+    g_blit_params = make_buffer(sizeof(BlitParams), WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
     WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     be[0].binding = 0;
     be[0].buffer = g_scratch;
     be[0].size = WGPU_WHOLE_SIZE;
     be[1].binding = 1;
     be[1].buffer = g_blit_params;
-    be[1].size = 32;
+    be[1].size = sizeof(BlitParams);
     WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bd.layout = layout;
     bd.entryCount = 2;
@@ -4363,26 +4435,56 @@ std::uint32_t display_params(const DisplaySource &src, std::uint32_t scratch_at)
                         o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby, static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height});
 }
 
-bool present(const DisplaySource &src) {
+// Frame mode presents one scanout field from a half-height framebuffer. Opposite parities
+// have a one-scanline phase difference. Framebuffer page flips are valid between fields;
+// the read circuit, origin and format must still match.
+bool compatible_display(const DisplayRegs &a, const DisplayRegs &b) {
+    const unsigned circuit = (a.pmode & 2u) ? 1u : 0u;
+    return a.pmode == b.pmode && a.smode2 == b.smode2 && a.display[circuit] == b.display[circuit] &&
+           ((a.dispfb[circuit] ^ b.dispfb[circuit]) >> 9) == 0;
+}
+
+bool consecutive_field(const DisplayRegs &r, const DisplayRegs &field, std::uint32_t age) {
+    return g_display_history >= age && r.frame >= age && r.frame - age == field.frame &&
+           (r.odd_field != field.odd_field) == ((age & 1u) != 0u) && compatible_display(r, field);
+}
+
+bool present(const DisplaySource &src, const DisplayRegs &regs) {
     if (!g_surface) return false;
     static PresentLog log;
     const double flush0 = log.flush, acquire0 = log.acquire, submit0 = log.submit, present0 = log.present;
     if (log.on) log.mark = PresentLog::Clock::now();
     flush_all();
     if (log.on) log.lap(log.flush);
-    const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
-    static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
-    const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
+    const std::uint32_t current = field_base(g_field), previous = field_base(g_field + g_field_slots - 1);
+    const std::uint32_t older = field_base(g_field + g_field_slots - 2);
+    const std::uint32_t oldest = g_field_slots >= 4 ? field_base(g_field + g_field_slots - 3) : current;
+    static const bool blend_disabled = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
+    const auto video = ps2::video_options();
+    const bool history = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !blend_disabled;
+    const bool align_source = src.halved && !src.overlay.active && ((regs.pmode & 3u) == 1u || (regs.pmode & 3u) == 2u);
+    const auto step = static_cast<std::int32_t>(g_scale);
+    const std::int32_t phase = history && align_source && consecutive_field(regs, g_previous_display, 1) ?
+                                   (regs.odd_field ? -step : step) : 0;
+    const bool motion_history = phase != 0 && g_field_slots >= 3 && consecutive_field(regs, g_older_display, 2) &&
+                                src.width * src.height <= (1u << 19);
+    const bool dual_history = motion_history && g_field_slots >= 4 && consecutive_field(regs, g_oldest_display, 3);
+    g_oldest_display = g_older_display;
+    g_older_display = g_previous_display;
+    g_previous_display = regs;
+    g_display_history = std::min(g_display_history + 1, 3u);
     const std::uint32_t param = display_params(src, current);
     push_display(src, current, param);
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
-    const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
+    const BlitParams blit{src.width * g_scale, src.height * g_scale, current, previous, history ? 1u : 0u,
+                          static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), video,
+                          phase, align_source ? 1u : 0u, older, motion_history ? 1u : 0u, oldest, dual_history ? 1u : 0u};
     post::drain();  // the last picture is presented before this one's acquire
-    std::memcpy(post::g_blit, blit, sizeof blit);  // written by the next submit (its job with the submit thread), before the frame's other writes
+    post::g_blit = blit;  // written by the next submit before the frame's other writes
     post::g_blit_pending = true;
-    ++g_field;
+    g_field = (g_field + 1) % g_field_slots;
     g_have_previous = true;
     g_last_width = src.width;
     g_last_height = src.height;
@@ -4529,6 +4631,12 @@ bool make_overlay_pipeline() {
 
 }  // namespace
 
+const char *active_renderer() { return g_mode == Mode::off ? "CPU" : g_renderer_name; }
+const char *active_present_mode() { return g_surface ? present_mode_name(g_present_mode) : nullptr; }
+bool supports_immediate_present() { return g_surface && g_immediate_present; }
+bool supports_motion_fields() { return g_surface && g_field_slots >= 3; }
+bool supports_dual_motion_fields() { return g_surface && g_field_slots >= 4; }
+
 void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height, std::uint32_t x, std::uint32_t y) {
     post::drain();
     if (!rgba || !width || !height || !g_surface) {
@@ -4574,7 +4682,7 @@ bool present_again() {
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
     const std::uint32_t tail[3] = {static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
-    wgpuQueueWriteBuffer(g_queue, g_blit_params, 20, tail, sizeof tail);
+    wgpuQueueWriteBuffer(g_queue, g_blit_params, offsetof(BlitParams, out_width), tail, sizeof tail);
     WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
     wgpuSurfaceGetCurrentTexture(g_surface, &st);
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {

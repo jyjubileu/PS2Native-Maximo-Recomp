@@ -37,6 +37,7 @@
 #include <cmath>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -45,7 +46,9 @@
 #include <vector>
 
 #include "keymap.hpp"
+#include "maximo_weapons.hpp"
 #include "quickmenu.hpp"
+#include "settings.hpp"
 #include "ps2/crash.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
@@ -57,26 +60,13 @@
 
 namespace {
 
+constexpr int kL2Bit = 8, kCircleBit = 13;
+
 enum Button : std::uint16_t {
     kSelect = 1u << 0, kL3 = 1u << 1, kR3 = 1u << 2, kStart = 1u << 3,
     kUp = 1u << 4, kRight = 1u << 5, kDown = 1u << 6, kLeft = 1u << 7,
-    kL2 = 1u << 8, kR2 = 1u << 9, kL1 = 1u << 10, kR1 = 1u << 11,
-    kTriangle = 1u << 12, kCircle = 1u << 13, kCross = 1u << 14, kSquare = 1u << 15,
-};
-
-struct PadBinding {
-    SDL_GameControllerButton button;
-    std::uint16_t mask;
-};
-
-constexpr PadBinding kPadButtons[] = {
-    {SDL_CONTROLLER_BUTTON_A, kCross},          {SDL_CONTROLLER_BUTTON_B, kCircle},
-    {SDL_CONTROLLER_BUTTON_X, kSquare},         {SDL_CONTROLLER_BUTTON_Y, kTriangle},
-    {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, kL1},  {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, kR1},
-    {SDL_CONTROLLER_BUTTON_LEFTSTICK, kL3},     {SDL_CONTROLLER_BUTTON_RIGHTSTICK, kR3},
-    {SDL_CONTROLLER_BUTTON_BACK, kSelect},      {SDL_CONTROLLER_BUTTON_START, kStart},
-    {SDL_CONTROLLER_BUTTON_DPAD_UP, kUp},       {SDL_CONTROLLER_BUTTON_DPAD_DOWN, kDown},
-    {SDL_CONTROLLER_BUTTON_DPAD_LEFT, kLeft},   {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, kRight},
+    kL2 = 1u << kL2Bit, kR2 = 1u << 9, kL1 = 1u << 10, kR1 = 1u << 11,
+    kTriangle = 1u << 12, kCircle = 1u << kCircleBit, kCross = 1u << 14, kSquare = 1u << 15,
 };
 
 SDL_Window *g_window = nullptr;
@@ -111,7 +101,7 @@ void window_stage(const char *name) {
 // Which key works which button comes from keys.ini (written with the defaults on the first start, read again when the window
 // gets the focus back after the file changed). The arrow keys are the D-pad only: they used to push the left stick as well, and
 // a menu that reads both moved two entries for one press.
-keymap::Config g_keys = keymap::defaults();
+keymap::Config g_legacy_keys = keymap::defaults(), g_keys = g_legacy_keys;
 std::string g_keys_path;
 std::filesystem::file_time_type g_keys_time{};
 int g_mouse_sum_x = 0, g_mouse_sum_y = 0;  // mouse counts since the last sample (only while the mouse pushes a stick)
@@ -120,10 +110,33 @@ double g_mouse_vx = 0.0, g_mouse_vy = 0.0;  // counts per millisecond, smoothed
 Uint32 g_wheel_up_until = 0, g_wheel_down_until = 0;
 int g_last_dx = 0, g_last_dy = -1;  // the last direction the walk keys gave, for a roll without one
 
+using rexsettings::Renderer;
+using rexsettings::Sync;
+using rexsettings::WeaponSwitch;
+rexsettings::Preferences g_settings, g_draft;
+std::string g_settings_path;
+
 // The picture look (F2): how the picture is enlarged and smoothed for the window (display only, the game and the saved pictures do not
-// change). The choice sits in keys.ini ('look = ...'); PS2_LOOK=0..5 or a look word overrides it for a run and is not written.
+// change). PS2_LOOK=0..5 or a look word overrides the saved preset for this run.
 int g_look = keymap::kDefaultLook;
 bool g_look_forced = false;
+bool g_current_field_forced = false;
+
+void apply_video_options() {
+    auto options = static_cast<std::uint32_t>(g_look);
+    if (g_settings.current_field) options |= ps2::kVideoCurrentField;
+    else if (g_settings.align_fields || g_settings.motion_fields || g_settings.dual_motion_fields) {
+        options |= ps2::kVideoAlignedFields;
+        if (g_settings.motion_fields || g_settings.dual_motion_fields) options |= ps2::kVideoMotionFields;
+        if (g_settings.dual_motion_fields) options |= ps2::kVideoDualMotionFields;
+    }
+    if (g_settings.area_reduction) options |= ps2::kVideoAreaReduction;
+    using rexsettings::AntiAliasing;
+    if (g_settings.anti_aliasing == AntiAliasing::fxaa) options |= ps2::kVideoFXAA;
+    if (g_settings.anti_aliasing == AntiAliasing::smaa) options |= ps2::kVideoSMAA;
+    if (g_settings.cas) options |= static_cast<std::uint32_t>(g_settings.cas_strength) << ps2::kVideoCasShift;
+    ps2::set_video_options(options);
+}
 
 // The title shows the speed; for a few seconds after F5, F8 or F9 a message is put in front of it.
 std::string g_speed_title = "ps2-native-recomp";
@@ -142,21 +155,51 @@ bool g_beep_on = true;
 // drawing the last picture with the panel over it. The game's controller ports get nothing while it is open, and after it a port gets
 // nothing until its buttons are all let go (the Enter or Cross that chose "Resume" must not reach the game).
 quickmenu::Menu g_menu;
+maximo::WeaponWheel g_weapon_wheel;
+maximo::WheelView g_painted_wheel;
+constexpr int kWheelCapture = rexsettings::kPadButtons;
+bool g_wheel_keyboard = false;
+SDL_JoystickID g_wheel_device = -1;
+int g_wheel_button = -1;
+int g_wheel_cancel_input = -1;
+bool g_wheel_right_latched = false;
+bool g_block_input[2] = {};
+Uint32 g_l2_event_time = 0;
+enum class WheelL2 { wait_for_release, ready, holding };
+WheelL2 g_wheel_l2 = WheelL2::wait_for_release;
+
+bool open_weapon_wheel() {
+    if (g_block_input[0] || !g_weapon_wheel.open()) return false;
+    g_wheel_right_latched = true;
+    return true;
+}
+
+void cancel_weapon_wheel() {
+    g_weapon_wheel.cancel();
+    g_wheel_keyboard = false;
+    g_wheel_device = -1;
+    g_wheel_l2 = WheelL2::wait_for_release;
+}
+
 std::atomic<bool> g_menu_hold{false};
-std::string g_key_note;  // the keys page's message line: what the last change did
+std::string g_key_note;
+enum class ControlsPage { overview, keyboard, gamepad };
+ControlsPage g_controls_page = ControlsPage::overview;
+bool g_quit_armed = false;
+int g_key_capture = -1, g_pad_capture = -1;
+std::array<std::array<bool, 2>, 2> g_trigger_capture_ready{};
 bool g_menu_redraw = false;  // show the picture again: the panel changed while the game sends none
 quickmenu::Picture g_menu_picture;
 SDL_Texture *g_menu_texture = nullptr;  // the panel for the SDL renderer (PS2_SDL_RENDERER=1)
 int g_menu_texture_w = 0, g_menu_texture_h = 0;
 Uint32 g_menu_opened_ticks = 0;
-bool g_block_input[2] = {};
+bool g_focus_suspended = false;
 int g_stick_step[2] = {};  // the left stick moving the highlight: -1 up, 1 down, 0 near the middle
-// The inner resolution (PS2_SCALE): the one of this run, and the one keys.ini holds for the next start (the menu changes that one).
-int g_scale_now = 1, g_scale_next = 1;
-bool g_scale_locked = false;  // PS2_SCALE was set before the start: keys.ini does not count
-// The filter of upscaled 2D art (PS2_SHARP_2D: 0 soft, 1 sharp, 2 sharpest), the same way: this run's and keys.ini's for the next start.
-int g_sharp_now = 1, g_sharp_next = 1;
-bool g_sharp_locked = false;
+// Video options latched before GS initialization.
+int g_scale_now = 1;
+bool g_scale_locked = false, g_sharp_locked = false, g_renderer_locked = false, g_sync_locked = false;
+bool g_reset_fps_sample = false;
+std::string g_fps_text;
 // A short note drawn over the picture for a moment after the menu is closed ("Saved", "Loaded"): the menu asked for a quick save or load
 bool g_note_wanted = false;  // a save or load was asked by the menu: the next message about it is shown over the picture
 std::string g_note_text;  // not empty while the note is up
@@ -238,10 +281,38 @@ bool attach_gpu() {
     return attached;
 }
 
-std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
-    const int v = SDL_GameControllerGetAxis(pad, a);
-    return static_cast<std::uint8_t>(std::clamp((v + 32768) >> 8, 0, 255));
+constexpr int kTriggerThreshold = 2000;
+constexpr int kWheelPressThreshold = 8000;
+
+int trigger_value(SDL_GameController *pad, int input) {
+    const auto axis = input == rexsettings::kLeftTrigger ? SDL_CONTROLLER_AXIS_TRIGGERLEFT : SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
+    return SDL_GameControllerGetAxis(pad, axis);
 }
+
+int pad_control_value(SDL_GameController *pad, int input) {
+    if (input >= rexsettings::kLeftTrigger) return trigger_value(pad, input);
+    return SDL_GameControllerGetButton(pad, static_cast<SDL_GameControllerButton>(input)) ? 32767 : 0;
+}
+
+struct BackGesture {
+    Uint32 since = 0, tap_until = 0;
+    bool combo = false;
+
+    bool read(bool back, bool start) {
+        const Uint32 now = SDL_GetTicks();
+        if (back) {
+            if (!since) since = now ? now : 1;
+            combo |= start;
+            return !combo && static_cast<Sint32>(now - since) >= 300;
+        }
+        if (since && !combo) tap_until = now + 80;
+        since = 0;
+        combo = false;
+        return static_cast<Sint32>(tap_until - now) > 0;
+    }
+};
+
+BackGesture g_back_gesture[2];
 
 void rumble(int port) {
     static double last_strong[2] = {};
@@ -249,7 +320,7 @@ void rumble(int port) {
     static Uint32 sent[2] = {};
     SDL_GameController *pad = g_pads[port];
     if (!pad) return;
-    const std::uint16_t motors = ps2::pad_rumble(port);
+    const std::uint16_t motors = g_settings.pad.rumble ? ps2::pad_rumble(port) : 0;
     const double strong = (motors >> 8) < 16 ? 0.0 : std::sqrt((motors >> 8) / 255.0);
     const bool weak = motors & 1u;
     const Uint32 now = SDL_GetTicks();
@@ -300,6 +371,14 @@ void close_pad(SDL_JoystickID id) {
         std::fprintf(stderr, "[pad] %s unplugged from port %d\n", or_unknown(SDL_GameControllerName(pad)), port + 1);
         SDL_GameControllerClose(pad);
         pad = nullptr;
+        if (port == 0) {
+            if (g_settings.pad.weapon_switch == WeaponSwitch::dpad) g_weapon_wheel.cancel();
+            g_wheel_l2 = WheelL2::wait_for_release;
+            g_wheel_cancel_input = -1;
+            g_l2_event_time = 0;
+        }
+        g_back_gesture[port] = {};
+        g_stick_step[port] = 0;
     }
 }
 
@@ -313,10 +392,11 @@ void close_pad(SDL_JoystickID id) {
 //                                             rightshoulder dpup dpdown dpleft dpright
 //   <frame> axis <n> <name> <value> <frames>  holds a stick or a trigger: leftx lefty rightx righty from -32768 to 32767 (0 is
 //                                             the middle, negative is left or up), lefttrigger righttrigger from 0 to 32767
-// Lines starting with # are comments. Controller input then counts while the window is in the background too, so a test
-// does not depend on which window has the focus.
+//   <frame> key <scancode>                   posts an SDL key event for a menu/host shortcut (e.g. F1, F5, F8, F9, Tab)
+//   <frame> keydown / keyup <scancode>      press or release a held shortcut
+// Lines starting with # are comments. These inputs still pass through the window's focus and menu routing.
 struct Step {
-    enum Kind { kPlug, kUnplug, kButton, kAxis };
+    enum Kind { kPlug, kUnplug, kButton, kAxis, kKey, kKeyDown, kKeyUp };
     std::uint64_t frame = 0, frames = 0;
     Kind kind = kPlug;
     int pad = 0, control = 0, value = 0;
@@ -376,7 +456,11 @@ void load_pad_script(const std::string &path) {
         step.pad = pad;
         const std::string w = what;
         bool ok = fields >= 3 && pad >= 0 && pad < 4;
-        if (ok && (w == "plug" || w == "unplug")) step.kind = w == "plug" ? Step::kPlug : Step::kUnplug;
+        if ((w == "key" || w == "keydown" || w == "keyup") && std::sscanf(line, "%*u %*s %31s", name) == 1) {
+            step.kind = w == "key" ? Step::kKey : w == "keydown" ? Step::kKeyDown : Step::kKeyUp;
+            step.control = SDL_GetScancodeFromName(name);
+            ok = step.control != SDL_SCANCODE_UNKNOWN;
+        } else if (ok && (w == "plug" || w == "unplug")) step.kind = w == "plug" ? Step::kPlug : Step::kUnplug;
         else if (ok && w == "button" && std::sscanf(line, "%*u %*s %*d %*s %llu", &frames) == 1) {
             step.kind = Step::kButton;
             step.control = SDL_GameControllerGetButtonFromString(name);
@@ -420,7 +504,7 @@ void plug_virtual(int n, bool on) {
     desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
     desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
     desc.naxes = SDL_CONTROLLER_AXIS_MAX;
-    desc.nbuttons = SDL_CONTROLLER_BUTTON_DPAD_RIGHT + 1;
+    desc.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
     desc.name = kNames[n];
     desc.userdata = reinterpret_cast<void *>(static_cast<std::intptr_t>(n));
     desc.Rumble = virtual_rumble;
@@ -458,6 +542,19 @@ void play_pad_script() {
     }
     for (; g_next_step < g_script.size() && g_script[g_next_step].frame <= now; ++g_next_step) {
         const Step &s = g_script[g_next_step];
+        if (s.kind == Step::kKey || s.kind == Step::kKeyDown || s.kind == Step::kKeyUp) {
+            const auto send = [&](bool down) {
+                SDL_Event e{};
+                e.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+                e.key.windowID = SDL_GetWindowID(g_window);
+                e.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+                e.key.keysym.scancode = static_cast<SDL_Scancode>(s.control);
+                SDL_PushEvent(&e);
+            };
+            send(s.kind != Step::kKeyUp);
+            if (s.kind == Step::kKey) send(false);
+            continue;
+        }
         if (s.kind == Step::kPlug || s.kind == Step::kUnplug) {
             plug_virtual(s.pad, s.kind == Step::kPlug);
             continue;
@@ -481,6 +578,7 @@ void apply_mouse_mode() {
     if ((SDL_GetRelativeMouseMode() == SDL_TRUE) != want) SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE);
     g_mouse_sum_x = g_mouse_sum_y = 0;
     g_mouse_vx = g_mouse_vy = 0.0;
+    g_wheel_up_until = g_wheel_down_until = 0;
 }
 
 void remember_keys_time() {
@@ -499,22 +597,28 @@ void load_keys() {
         while ((n = std::fread(buffer, 1, sizeof buffer, f)) > 0) text.append(buffer, n);
         std::fclose(f);
         have = true;
-    } else if (std::FILE *out = ps2::os::open(g_keys_path, "w")) {
-        const std::string defaults = keymap::default_file_text();
-        std::fwrite(defaults.data(), 1, defaults.size(), out);
-        std::fclose(out);
-        std::fprintf(stderr, "[keys] wrote %s with the default keys\n", g_keys_path.c_str());
     } else {
-        std::fprintf(stderr, "[keys] cannot write %s: the default keys are used and cannot be changed\n", g_keys_path.c_str());
+        std::error_code error;
+        const auto status = std::filesystem::status(ps2::os::path(g_keys_path), error);
+        if (status.type() == std::filesystem::file_type::not_found) {
+            const std::string defaults = keymap::default_file_text();
+            if (auto *out = ps2::os::open(g_keys_path, "wb")) {
+                std::fwrite(defaults.data(), 1, defaults.size(), out);
+                std::fclose(out);
+                std::fprintf(stderr, "[keys] wrote %s with the default keys\n", g_keys_path.c_str());
+            }
+        } else {
+            std::fprintf(stderr, "[keys] cannot read %s: using defaults\n", g_keys_path.c_str());
+        }
     }
     keymap::Config config = keymap::defaults();
     std::vector<std::string> problems;
     if (have) keymap::parse(text, config, problems);
     for (const std::string &p : problems) std::fprintf(stderr, "[keys] %s, %s\n", g_keys_path.c_str(), p.c_str());
-    g_keys = config;
-    if (!g_look_forced && config.look >= 0) g_look = config.look;
-    g_keys.look = g_look;
-    ps2::set_video_options(static_cast<std::uint32_t>(g_look));
+    g_legacy_keys = std::move(config);
+    g_keys = rexsettings::keyboard(g_settings, g_legacy_keys);
+    if (!g_look_forced) g_look = g_settings.look >= 0 ? g_settings.look : (g_keys.look >= 0 ? g_keys.look : keymap::kDefaultLook);
+    apply_video_options();
     remember_keys_time();
     std::fprintf(stderr, "[keys] %s: %s%zu problem%s; mouse stick %s\n", g_keys_path.c_str(), have ? "read, " : "defaults, ", problems.size(),
                  problems.size() == 1 ? "" : "s", g_keys.mouse_stick == 0 ? "off" : g_keys.mouse_stick == 1 ? "left" : "right");
@@ -599,9 +703,11 @@ void show_key_card(const char *why) {
     if (g_card.state.load(std::memory_order_acquire) != 0) return;  // one box at a time
 #endif
     reload_keys_if_changed();
-    g_card.text = keymap::card_text(g_keys);
+    auto current = g_keys;
+    current.look = g_look;
+    g_card.text = keymap::card_text(current);
     if (!g_keys_path.empty())
-        g_card.text += "\nTo change keys: \"Change keys\" in the quick menu, or edit this file (the game reads it again when you come back):\n" + g_keys_path + "\n";
+        g_card.text += "\nRemap in F1 > Controles. The base keyboard layout is read from:\n" + g_keys_path + "\n";
     if (g_notice_text == kStartNotice) {
         g_notice_text.clear();
         refresh_title();
@@ -692,14 +798,16 @@ void mouse_stick_value(std::uint8_t &x, std::uint8_t &y) {
 }
 
 // the keyboard and the mouse as the first controller
-void read_keyboard(std::uint16_t &pressed, std::uint8_t &lx, std::uint8_t &ly, std::uint8_t &rx, std::uint8_t &ry) {
+void read_keyboard(std::uint16_t &pressed, std::uint8_t &lx, std::uint8_t &ly, std::uint8_t &rx, std::uint8_t &ry, bool selecting_weapon) {
     static const std::uint16_t kDpad[] = {kUp, kDown, kLeft, kRight};
     const Uint8 *keys = SDL_GetKeyboardState(nullptr);
     // mouse buttons only count while the window is the one in front (a click on another window is not for the game)
     const bool focus = !g_window || (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS);
-    const Uint32 mouse = focus ? SDL_GetMouseState(nullptr, nullptr) : 0;
+    if (!focus) return;
+    const Uint32 mouse = SDL_GetMouseState(nullptr, nullptr);
     const Uint32 now = SDL_GetTicks();
     const auto down = [&](int input) {
+        if (selecting_weapon && input >= SDL_SCANCODE_RIGHT && input <= SDL_SCANCODE_UP) return false;
         switch (input) {
         case keymap::kMouseLeft: return (mouse & SDL_BUTTON_LMASK) != 0;
         case keymap::kMouseMiddle: return (mouse & SDL_BUTTON_MMASK) != 0;
@@ -736,7 +844,7 @@ void read_keyboard(std::uint16_t &pressed, std::uint8_t &lx, std::uint8_t &ly, s
     const int rdy = (any(keymap::RightDown) ? 1 : 0) - (any(keymap::RightUp) ? 1 : 0);
     push_stick(ldx, ldy, lx, ly);
     push_stick(rdx, rdy, rx, ry);
-    if (ldx || ldy) {
+    if ((ldx || ldy) && !g_menu.is_open() && !g_block_input[0] && !g_focus_suspended) {
         g_last_dx = ldx;
         g_last_dy = ldy;
     }
@@ -755,6 +863,37 @@ void read_keyboard(std::uint16_t &pressed, std::uint8_t &lx, std::uint8_t &ly, s
     }
 }
 
+void filter_weapon_dpad(std::uint16_t &pressed) {
+    constexpr std::uint16_t directions = kUp | kRight | kDown | kLeft;
+    static std::uint16_t held = 0;
+    static std::uint16_t captured = 0;
+    const auto down = static_cast<std::uint16_t>(pressed & directions);
+    const auto newly_pressed = down & ~held;
+    held = down;
+    captured &= down;
+
+    if (down && g_settings.pad.weapon_switch == WeaponSwitch::dpad &&
+        !(pressed & (kSelect | kStart)) && g_weapon_wheel.can_capture_dpad()) {
+        captured |= down;
+        int weapon = -1;
+        switch (newly_pressed) {
+        case kUp: weapon = 0; break;
+        case kRight: weapon = 1; break;
+        case kDown: weapon = 3; break;
+        case kLeft: weapon = 2; break;
+        default: break;
+        }
+        if (weapon >= 0) {
+            std::fprintf(stderr, "[dpad-input] press f=%llu ms=%llu weapon=%d\n",
+                         static_cast<unsigned long long>(ps2::frames_run()),
+                         static_cast<unsigned long long>(SDL_GetTicks64()), weapon);
+            g_weapon_wheel.request_weapon(weapon);
+        }
+    }
+    // A direction consumed during gameplay must be released before the menus see it.
+    pressed &= ~captured;
+}
+
 void poll_port(int port) {
     static bool plugged[2] = {};
     SDL_GameController *pad = g_pads[port];
@@ -762,55 +901,84 @@ void poll_port(int port) {
         plugged[port] = pad != nullptr;
         ps2::set_pad_connected(port, plugged[port]);
     }
+    static std::uint64_t last[2] = {~0ull, ~0ull};
+    const bool selecting_weapon = port == 0 && g_weapon_wheel.view().open;
+    if (port == 0 && g_wheel_cancel_input >= 0 &&
+        (!pad || pad_control_value(pad, g_wheel_cancel_input) <= kTriggerThreshold))
+        g_wheel_cancel_input = -1;
     std::uint16_t pressed = 0;
     std::uint8_t l2 = 0xFF, r2 = 0xFF;
     std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
-    if (port == 0) read_keyboard(pressed, lx, ly, rx, ry);
-    if (pad) {
-        for (const PadBinding &b : kPadButtons)
-            if (b.button != SDL_CONTROLLER_BUTTON_BACK && SDL_GameControllerGetButton(pad, b.button)) pressed |= b.mask;
-        // Select, then Start opens the quick menu, and the game must get neither. So the game gets this Select late: once it has been
-        // held for 300 ms without Start, or as a short press when it is let go without Start. (Start first and then Select would
-        // already have reached the game: the way is Select first.) A Select of the keyboard (Tab) is not held back.
-        static Uint32 select_since[2] = {}, select_tap_until[2] = {};
-        static bool select_combo[2] = {};
-        const bool sel = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK), st = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
-        const Uint32 now = SDL_GetTicks();
-        bool select_to_game = false;
-        if (sel) {
-            if (!select_since[port]) select_since[port] = now ? now : 1;
-            if (st) select_combo[port] = true;
-            select_to_game = !select_combo[port] && now - select_since[port] >= 300;
-        } else {
-            if (select_since[port] && !select_combo[port]) select_tap_until[port] = now + 80;
-            select_since[port] = 0;
-            select_combo[port] = false;
-        }
-        if (select_to_game || static_cast<Sint32>(select_tap_until[port] - now) > 0) pressed |= kSelect;
-        if (sel && st) pressed &= ~kStart;
-        const auto trigger = [&](SDL_GameControllerAxis a, std::uint16_t bit, std::uint8_t &pressure) {
-            const int v = SDL_GameControllerGetAxis(pad, a);
-            if (v <= 2000 || (pressed & bit)) return;
-            pressed |= bit;
-            pressure = static_cast<std::uint8_t>(std::max(1, v * 255 / 32767));
-        };
-        trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT, kL2, l2);
-        trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, kR2, r2);
-        if (lx == 0x80) lx = axis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-        if (ly == 0x80) ly = axis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-        if (rx == 0x80) rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
-        if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
-    }
-    if (g_menu.is_open()) g_block_input[port] = true;
+    if (port == 0) read_keyboard(pressed, lx, ly, rx, ry, selecting_weapon);
+    const bool keyboard_right_centered = rx == 0x80 && ry == 0x80;
+    const std::uint16_t intercepted = port == 0 && g_settings.pad.weapon_switch == WeaponSwitch::radial ? kL2 : 0;
+    pressed &= ~intercepted;
+    const bool back = pad && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
+    const bool start = pad && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
+    const bool in_modal = g_menu.is_open() || g_focus_suspended;
+    if (in_modal) g_block_input[port] = true;
     if (g_block_input[port]) {
-        if (!pressed) g_block_input[port] = false;  // all let go: from the next pass on the game gets this port again
+        bool held = pressed || lx != 0x80 || ly != 0x80 || rx != 0x80 || ry != 0x80;
+        if (pad && !in_modal) {
+            held |= back || start;
+            for (int b = 0; b < rexsettings::kPadButtons; ++b) {
+                if (intercepted & (1u << b)) continue;
+                const int input = g_settings.pad.buttons[b];
+                if (input >= rexsettings::kLeftTrigger) held |= trigger_value(pad, input) > kTriggerThreshold;
+                else held |= SDL_GameControllerGetButton(pad, static_cast<SDL_GameControllerButton>(input)) != 0;
+            }
+            // Check physical deflection before sensitivity/dead-zone transforms, allowing small idle drift.
+            for (int a = SDL_CONTROLLER_AXIS_LEFTX; a <= SDL_CONTROLLER_AXIS_RIGHTY; ++a)
+                held |= std::abs(SDL_GameControllerGetAxis(pad, static_cast<SDL_GameControllerAxis>(a))) > 2048;
+        }
+        if (!in_modal && !held) g_block_input[port] = false;
+        g_back_gesture[port] = {};
         pressed = 0;
         lx = ly = rx = ry = 0x80;
-        l2 = r2 = 0xFF;
     } else {
-        rumble(port);  // while the game waits its rumble is not sent again, so it stops after 200 ms
+        if (pad) {
+            // The physical Back + Start shortcut is independent of the remapped PS2 buttons.
+            const bool game_back = g_back_gesture[port].read(back, start);
+            for (int b = 0; b < rexsettings::kPadButtons; ++b) {
+                const auto bit = static_cast<std::uint16_t>(1u << b);
+                if ((pressed | intercepted) & bit) continue;  // The keyboard takes precedence for the remaining buttons.
+                const int input = g_settings.pad.buttons[b];
+                if (port == 0 && input == g_wheel_cancel_input) continue;
+                if (input >= rexsettings::kLeftTrigger) {
+                    const int raw = trigger_value(pad, input);
+                    if (raw <= kTriggerThreshold) continue;
+                    pressed |= bit;
+                    const auto pressure = static_cast<std::uint8_t>(std::max(1, raw * 255 / 32767));
+                    if (bit == kL2) l2 = pressure;
+                    if (bit == kR2) r2 = pressure;
+                } else {
+                    const bool down = input == SDL_CONTROLLER_BUTTON_BACK ? game_back
+                                      : input == SDL_CONTROLLER_BUTTON_START ? start && !back
+                                      : SDL_GameControllerGetButton(pad, static_cast<SDL_GameControllerButton>(input)) != 0;
+                    if (down) pressed |= bit;
+                }
+            }
+            std::uint8_t *axes[] = {&lx, &ly, &rx, &ry};
+            for (int a = 0; a < 4; ++a) {
+                if (*axes[a] != 0x80) continue;
+                const auto raw = SDL_GameControllerGetAxis(pad, static_cast<SDL_GameControllerAxis>(SDL_CONTROLLER_AXIS_LEFTX + a));
+                *axes[a] = rexsettings::stick_value(raw, g_settings.pad, a);
+            }
+        }
+        rumble(port);
     }
-    static std::uint64_t last[2] = {~0ull, ~0ull};
+    if (port == 0) filter_weapon_dpad(pressed);
+    // Ignore the selection deflection until the right stick returns to center.
+    if (port == 0 && g_wheel_right_latched) {
+        const bool centered = !pad || (std::abs(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX)) <= 2048 &&
+                                       std::abs(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY)) <= 2048);
+        if (g_keys.mouse_stick == 2) {
+            g_mouse_sum_x = g_mouse_sum_y = 0;
+            g_mouse_vx = g_mouse_vy = 0.0;
+        }
+        if (!selecting_weapon && centered && keyboard_right_centered) g_wheel_right_latched = false;
+        rx = ry = 0x80;
+    }
     const std::uint64_t state = pressed | (static_cast<std::uint64_t>(rx) << 16) | (static_cast<std::uint64_t>(ry) << 24) | (static_cast<std::uint64_t>(lx) << 32) |
                                 (static_cast<std::uint64_t>(ly) << 40) | (static_cast<std::uint64_t>(l2) << 48) | (static_cast<std::uint64_t>(r2) << 56);
     if (state == last[port]) return;
@@ -834,47 +1002,137 @@ void poll_port(int port) {
     ps2::set_pad_axis(3, ly, port);
 }
 
-// keys.ini with some lines changed (`change` maps the file's text to the new text, e.g. with keymap::with_look), the other lines as they are
-void rewrite_keys_file(const std::function<std::string(const std::string &)> &change, const char *what) {
-    if (g_keys_path.empty()) return;
-    std::string text;
-    if (std::FILE *f = ps2::os::open(g_keys_path, "rb")) {
-        char buffer[4096];
-        std::size_t n;
-        while ((n = std::fread(buffer, 1, sizeof buffer, f)) > 0) text.append(buffer, n);
-        std::fclose(f);
-    } else {
-        text = keymap::default_file_text();
-    }
-    text = change(text);
-    if (std::FILE *out = ps2::os::open(g_keys_path, "wb")) {
-        std::fwrite(text.data(), 1, text.size(), out);
-        std::fclose(out);
-        remember_keys_time();
-    } else {
-        std::fprintf(stderr, "[keys] cannot write %s: the %s is kept until the game closes\n", g_keys_path.c_str(), what);
-    }
+int picture_look(const rexsettings::Preferences &p) {
+    return p.look >= 0 ? p.look : (g_keys.look >= 0 ? g_keys.look : keymap::kDefaultLook);
 }
 
-// F2: the next look (step -1: the one before, from the quick menu). The title says which one, and the choice goes into keys.ini (the
-// other lines of the file stay as they are).
-void cycle_look(int step = 1) {
-    g_look = (g_look + step + keymap::kLookCount) % keymap::kLookCount;
-    g_keys.look = g_look;
-    ps2::set_video_options(static_cast<std::uint32_t>(g_look));
-    g_notice_text = std::string("Picture look (F2): ") + keymap::look_name(g_look);
+int internal_scale(const rexsettings::Preferences &p) {
+    return p.scale ? p.scale : std::max(1, g_keys.scale);
+}
+
+int art_filter(const rexsettings::Preferences &p) {
+    return p.sharp_2d >= 0 ? p.sharp_2d : (g_keys.sharp_2d >= 0 ? g_keys.sharp_2d : 1);
+}
+
+const char *renderer_name() {
+#ifdef PS2_GPU
+    return ps2::gs::gpu::active_renderer();
+#else
+    return "CPU";
+#endif
+}
+
+bool gpu_choices() {
+#ifdef PS2_GPU
+    return g_renderer_locked ? std::string_view(renderer_name()) != "CPU" : g_draft.renderer != Renderer::cpu;
+#else
+    return false;
+#endif
+}
+
+bool immediate_present_available() {
+#ifdef PS2_GPU
+    return ps2::gs::gpu::supports_immediate_present();
+#else
+    return false;
+#endif
+}
+
+const char *current_sync_name() {
+#ifdef PS2_GPU
+    if (const auto *name = ps2::gs::gpu::active_present_mode()) return name;
+#endif
+    return "SDL";
+}
+
+bool save_preferences(const rexsettings::Preferences &p) {
+    std::string why;
+    if (!rexsettings::save(g_settings_path, p, why)) {
+        g_key_note = "Falha ao salvar as preferências.";
+        std::fprintf(stderr, "[settings] %s\n", why.c_str());
+        return false;
+    }
+    g_settings = p;
+    return true;
+}
+
+int next_look(int look, int step) {
+    return (look + step + keymap::kLookCount) % keymap::kLookCount;
+}
+
+// F2 is a live shortcut. With an environment override, it stays local to this run.
+void cycle_look() {
+    auto changed = g_settings;
+    changed.look = next_look(g_look, 1);
+    if (!g_look_forced && !save_preferences(changed)) {
+        g_notice_text = g_key_note;
+    } else {
+        g_look = changed.look;
+        apply_video_options();
+        if (g_menu.is_open() && !g_look_forced) g_draft.look = g_look;
+        g_notice_text = std::string("Picture look (F2): ") + keymap::look_name(g_look);
+        std::fprintf(stderr, "[video] picture look %d: %s\n", g_look, keymap::look_name(g_look));
+    }
     g_notice_until = SDL_GetTicks() + 4000;
     refresh_title();
-    std::fprintf(stderr, "[video] picture look %d: %s\n", g_look, keymap::look_name(g_look));
-    if (g_look_forced) return;
-    rewrite_keys_file([](const std::string &t) { return keymap::with_look(t, g_look); }, "look");
 }
 
-// --- the quick menu ---
+bool fullscreen() {
+    return g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN);
+}
+
+bool set_fullscreen(bool full) {
+    if (full == fullscreen()) return true;
+    if (SDL_SetWindowFullscreen(g_window, full ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0) return true;
+    std::fprintf(stderr, "[window] fullscreen: %s\n", SDL_GetError());
+    return false;
+}
 
 void toggle_fullscreen() {
-    const bool full = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
-    SDL_SetWindowFullscreen(g_window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+    if (!set_fullscreen(!fullscreen())) {
+        g_key_note = "O SDL recusou a mudança de modo da janela.";
+    } else if (g_menu.is_open()) {
+        g_draft.fullscreen = fullscreen();
+    }
+}
+
+void cycle_renderer(int step) {
+#ifdef PS2_GPU
+#ifdef _WIN32
+    constexpr Renderer choices[] = {Renderer::automatic, Renderer::d3d12, Renderer::vulkan, Renderer::cpu};
+#elif defined(__linux__)
+    constexpr Renderer choices[] = {Renderer::automatic, Renderer::vulkan, Renderer::cpu};
+#else
+    constexpr Renderer choices[] = {Renderer::automatic, Renderer::cpu};
+#endif
+    if (g_renderer_locked) return;
+    const auto it = std::find(std::begin(choices), std::end(choices), g_draft.renderer);
+    const int count = static_cast<int>(std::size(choices));
+    const int index = it == std::end(choices) ? 0 : static_cast<int>(it - std::begin(choices));
+    g_draft.renderer = choices[(count + index + step) % count];
+#else
+    (void)step;
+#endif
+}
+
+bool apply_preferences() {
+    const bool old_fullscreen = fullscreen();
+    const auto old_weapon_switch = g_settings.pad.weapon_switch;
+    if (!set_fullscreen(g_draft.fullscreen)) {
+        g_key_note = "O SDL recusou a mudança de modo da janela.";
+        return false;
+    }
+    if (!save_preferences(g_draft)) {
+        set_fullscreen(old_fullscreen);
+        return false;
+    }
+    if (!g_look_forced) g_look = picture_look(g_settings);
+    apply_video_options();
+    g_keys = rexsettings::keyboard(g_settings, g_legacy_keys);
+    // Clear the old pad sample while F1 still holds the game.
+    if (old_weapon_switch != g_settings.pad.weapon_switch) poll_port(0);
+    if (!g_settings.fps) g_fps_text.clear();
+    return true;
 }
 
 void window_pixels(int &w, int &h) {
@@ -883,10 +1141,173 @@ void window_pixels(int &w, int &h) {
     else SDL_GetWindowSizeInPixels(g_window, &w, &h);
 }
 
+bool motion_fields_available() {
+#ifdef PS2_GPU
+    return g_gpu_present && ps2::gs::gpu::supports_motion_fields();
+#else
+    return false;
+#endif
+}
+
+bool dual_motion_fields_available() {
+#ifdef PS2_GPU
+    return g_gpu_present && ps2::gs::gpu::supports_dual_motion_fields();
+#else
+    return false;
+#endif
+}
+
+quickmenu::View menu_view(int w, int h) {
+    using quickmenu::Command;
+    using quickmenu::Tab;
+    quickmenu::View v;
+    v.profile = ps2::g_options.widescreen ? "Perfil 16:9 widescreen" : "Perfil 4:3 original";
+    const auto render_now = std::string_view(renderer_name());
+    v.profile += "  |  " + std::string(render_now) + "  " + std::to_string(render_now == "CPU" ? 1 : g_scale_now) + "x";
+    v.settings = true;
+    v.note = g_key_note;
+    if (v.note.empty()) {
+        if (g_key_capture >= 0) v.note = "Pressione uma tecla ou botão do mouse. Esc cancela.";
+        if (g_pad_capture == kWheelCapture) v.note = "Pressione um botão livre. Backspace desliga.";
+        else if (g_pad_capture >= 0) v.note = "Pressione um botão ou gatilho do controle. Esc cancela.";
+    }
+    switch (g_menu.tab()) {
+    case Tab::graphics: {
+        const bool motion_requested = g_draft.motion_fields || g_draft.dual_motion_fields;
+        const bool aligned_fields = g_gpu_present && (g_draft.align_fields || motion_requested);
+        const bool motion_fields = motion_fields_available() && motion_requested;
+        const bool dual_motion_fields = dual_motion_fields_available() && g_draft.dual_motion_fields;
+        constexpr const char *kRendererLabels[] = {"Automático", "Direct3D 12", "Vulkan", "CPU"};
+        constexpr const char *kSyncLabels[] = {"Automática", "Ligada (FIFO)", "Imediata"};
+        constexpr const char *kLooks[] = {"Nítida", "Nítida + contornos", "Suave", "Suave + contornos", "Realçada", "Realçada + contornos"};
+        constexpr const char *kFilters[] = {"Suave", "Nítido", "Mais nítido"};
+        constexpr const char *kAntiAliasing[] = {"Desligado", "FXAA", "SMAA 1x"};
+        const bool gpu = gpu_choices();
+#ifdef PS2_GPU
+        const bool change_renderer = !g_renderer_locked;
+#else
+        const bool change_renderer = false;
+#endif
+        const auto scale = g_scale_locked ? g_scale_now : internal_scale(g_draft);
+        v.rows = {
+            {Command::renderer, "Renderizador",
+             change_renderer ? kRendererLabels[static_cast<int>(g_draft.renderer)] : renderer_name(),
+             change_renderer ? "Reinicie para aplicar o renderizador escolhido." : "Renderizador definido na inicialização.", true, change_renderer},
+            {Command::scale, "Resolução interna", std::to_string(gpu ? scale : 1) + "x",
+             !gpu ? "A renderização CPU usa 1x." : g_scale_locked ? "Controlada por PS2_SCALE." : "Reinicie para aplicar a escala interna.",
+             true, gpu && !g_scale_locked},
+            {Command::fullscreen, "Modo da janela", g_draft.fullscreen ? "Tela cheia" : "Janela",
+             "Aplicação imediata. F11 alterna o modo da sessão.", true},
+            {Command::sync, "Sincronização vertical", g_sync_locked ? current_sync_name() : kSyncLabels[static_cast<int>(g_draft.sync)],
+             !gpu ? "Disponível no caminho de apresentação WebGPU."
+                  : g_sync_locked ? "Controlada por PS2_PRESENT_MODE." : "Reinicie para aplicar. Atual: " + std::string(current_sync_name()),
+             true, gpu && !g_sync_locked},
+            {Command::look, "Apresentação", kLooks[g_look_forced ? g_look : picture_look(g_draft)],
+             g_look_forced ? "Controlada por PS2_LOOK." : "Ajusta a ampliação da imagem. Atalho F2.", true, !g_look_forced},
+            {Command::sharp_2d, "Filtro de texto e arte 2D",
+             kFilters[g_sharp_locked ? std::clamp(std::atoi(ps2::os::env("PS2_SHARP_2D").c_str()), 0, 2) : art_filter(g_draft)],
+             g_sharp_locked ? "Controlado por PS2_SHARP_2D." : "Filtro GPU de arte 2D ampliada. Requer reiniciar.", true, gpu && !g_sharp_locked},
+            {Command::fps, "FPS e tempo por quadro", g_draft.fps ? "Ligado" : "Desligado",
+             "Mostra a cadência do host durante o jogo.", true},
+            {Command::current_field, "Composição entrelaçada",
+             g_current_field_forced || g_draft.current_field ? "Campo atual" :
+                 dual_motion_fields ? "Adaptativos (dois pares)" :
+                 motion_fields ? "Alinhados adaptativos" : aligned_fields ? "Campos alinhados" : "Mesclar campos",
+             g_current_field_forced ? "Controlada por PS2_NO_DEINTERLACE." :
+                 dual_motion_fields ? "Compara o movimento nas duas paridades (experimental)." :
+                 motion_fields ? "Reduz a mistura nas regiões em movimento (experimental)." :
+                 g_gpu_present ? "Campos alinhados corrige a fase vertical antes da mistura." :
+                                 "Use apresentação WebGPU para selecionar Campos alinhados.",
+             true, !g_current_field_forced},
+            {Command::anti_aliasing, "Anti-aliasing", kAntiAliasing[static_cast<int>(g_draft.anti_aliasing)],
+             g_gpu_present ? "FXAA e SMAA substituem o tratamento de contornos na saída. Aplicação imediata."
+                           : "Disponível com apresentação WebGPU.", true, g_gpu_present},
+            {Command::cas, "Nitidez adaptativa (CAS)", g_draft.cas ? "Ligado" : "Desligado",
+             g_gpu_present ? "AMD FidelityFX CAS aplica nitidez após o anti-aliasing. Aplicação imediata."
+                           : "Disponível com apresentação WebGPU.", true, g_gpu_present},
+            {Command::cas_strength, "Intensidade do CAS", std::to_string(g_draft.cas_strength) + "%",
+             "Ajuste em passos de 5%. 0% equivale a CAS desligado.", true, g_gpu_present && g_draft.cas},
+            {Command::area_reduction, "Redução da janela",
+             g_gpu_present && g_draft.area_reduction ? "Por área" : "Suave",
+             "Por área usa a cobertura dos texels quando os dois eixos são reduzidos (experimental).",
+             true, g_gpu_present},
+            {Command::none, "Saída", std::to_string(w) + " x " + std::to_string(h), "Redimensione a janela para ajustar a saída.", false, false},
+            {Command::none, "Proporção", ps2::g_options.widescreen ? "16:9" : "4:3",
+             "Escolha o outro perfil no launcher e reinicie.", false, false},
+        };
+        break;
+    }
+    case Tab::controls:
+        if (g_controls_page == ControlsPage::keyboard) {
+            const auto keys = rexsettings::keyboard(g_draft, g_legacy_keys);
+            for (int a = 0; a < keymap::kChangeableCount; ++a)
+                v.rows.push_back({Command::key_edit, keymap::action_label(a), keymap::keys_text(keys, a), "Escolha para remapear.", false, true, a});
+            v.rows.push_back({Command::reset_keys, "Restaurar teclado", "", "Recupera as teclas padrão. Use Aplicar para salvar."});
+        } else if (g_controls_page == ControlsPage::gamepad) {
+            const bool connected = g_pads[0] || g_pads[1];
+            for (int bit = 0; bit < rexsettings::kPadButtons; ++bit)
+                v.rows.push_back({Command::pad_edit, rexsettings::ps2_button_label(bit), rexsettings::pad_input_name(g_draft.pad.buttons[bit]),
+                                  connected ? "Escolha e pressione o botão físico." : "Conecte um gamepad para remapear.", false, connected, bit});
+            v.rows.push_back({Command::reset_pad, "Restaurar gamepad", "", "Recupera o mapeamento e ajustes padrão."});
+        } else {
+            const char *invert[] = {"Inverter X esquerdo", "Inverter Y esquerdo", "Inverter X direito", "Inverter Y direito"};
+            const auto flag = [](bool on) { return on ? "Ligado" : "Desligado"; };
+            v.rows = {
+                {Command::keyboard, "Teclado e mouse", "Configurar", "Altere as teclas dos botões e direções do PS2."},
+                {Command::gamepad, "Botões do gamepad", "Configurar", "O mapeamento vale para os dois controles do perfil."},
+                {Command::deadzone, "Zona morta", std::to_string(g_draft.pad.deadzone) + "%", "Ignora pequenas deflexões perto do centro.", true},
+                {Command::sensitivity, "Sensibilidade geral", std::to_string(g_draft.pad.sensitivity) + "%",
+                 "Ajusta os analógicos sem ganho próprio.", true},
+            };
+            if (g_weapon_wheel.supported()) {
+                const int input = g_draft.pad.weapon_wheel;
+                std::string label = input < 0 ? "Desligada" : rexsettings::pad_input_name(input);
+                if (label.empty()) label = "Botão " + std::to_string(input);
+                const bool dpad_mode = g_draft.pad.weapon_switch == WeaponSwitch::dpad;
+                v.rows.push_back({Command::wheel_pad, "Roda de armas", std::move(label),
+                                  dpad_mode ? "Disponível nos outros métodos." : "Defina o botão da roda. F3 funciona no teclado.", false, !dpad_mode});
+                static constexpr const char *kMethods[] = {"Original do PS2", "HUD radial", "D-Pad"};
+                static constexpr const char *kDetails[] = {
+                    "L2 alterna a família da arma.",
+                    "Segure L2, escolha no analógico direito e solte. B cancela.",
+                    "Troca instantânea pelo direcional no jogo. L2 mantém a função original.",
+                };
+                const auto method = static_cast<int>(g_draft.pad.weapon_switch);
+                v.rows.push_back({Command::weapon_switch, "Método de troca de armas", kMethods[method], kDetails[method], true});
+            }
+            for (int axis = 0; axis < 4; ++axis)
+                v.rows.push_back({Command::invert, invert[axis], flag(g_draft.pad.invert[axis]), "Inverte o eixo indicado.", true, true, axis});
+            v.rows.push_back({Command::rumble, "Vibração", flag(g_draft.pad.rumble), "Envia vibração a controles compatíveis com SDL.", true});
+            v.rows.push_back({Command::left_reference_gain, "Ganho esquerdo (PCSX2)", g_draft.pad.left_reference_gain ? "133%" : "Geral",
+                              "Escala de referência no esquerdo. Direito mantém o ganho geral.", true});
+            for (int port = 0; port < 2; ++port) {
+                auto *pad = g_pads[port];
+                v.rows.push_back({Command::none, "Controle " + std::to_string(port + 1),
+                                  pad ? or_unknown(SDL_GameControllerName(pad)) : "Desconectado",
+                                  pad && SDL_GameControllerHasRumble(pad) ? "Detectado pelo SDL. Oferece vibração." : "Detecção de dispositivo pelo SDL.",
+                                  false, false});
+            }
+        }
+        break;
+    case Tab::system:
+        v.rows = {
+            {Command::resume, "Voltar ao jogo", "F1", "Fecha o menu e continua a execução."},
+            {Command::save, "Salvar estado", "F5", "Salva no slot rápido."},
+            {Command::load, "Carregar estado", "F8", "Carrega o slot rápido."},
+            {Command::report, "Gerar relatório", "F9", "Captura o estado de diagnóstico do jogo."},
+            {Command::keys, "Atalhos e teclas", "Ver", "Mostra o mapa de teclas ativo."},
+            {Command::quit, "Sair do jogo", g_quit_armed ? "Confirme" : "", "Grava o cartão de memória antes de fechar."},
+        };
+        break;
+    }
+    return v;
+}
+
 // Makes the panel (the menu, or the note after it) for the window's size and hands it to the one who draws (or takes it away).
 void menu_paint(bool show_again = true) {
     if (show_again) g_menu_redraw = true;
-    g_overlay_on = g_menu.is_open() || !g_note_text.empty();
+    g_painted_wheel = g_weapon_wheel.view();
+    g_overlay_on = g_menu.is_open() || g_painted_wheel.open || !g_note_text.empty() || (g_settings.fps && !g_fps_text.empty());
     if (!g_overlay_on) {
 #ifdef PS2_GPU
         if (g_gpu_present) ps2::gs::gpu::set_overlay(nullptr, 0, 0, 0, 0);
@@ -896,22 +1317,13 @@ void menu_paint(bool show_again = true) {
     int w = 0, h = 0;
     window_pixels(w, h);
     if (g_menu.is_open()) {
-        quickmenu::Values v;
-        v.look = keymap::look_name(g_look);
-        v.scale_now = g_scale_now;
-        v.scale_next = g_scale_next;
-        v.scale_locked = g_scale_locked;
-        v.sharp_now = g_sharp_now;
-        v.sharp_next = g_sharp_next;
-        v.sharp_locked = g_sharp_locked;
-        v.fullscreen = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
-        if (g_menu.on_keys_page()) {
-            for (int a = 0; a < keymap::kChangeableCount; ++a) v.key_rows.push_back({keymap::action_label(a), keymap::keys_text(g_keys, a)});
-            v.key_note = g_key_note;
-        }
-        g_menu.draw(w, h, v, g_menu_picture);
+        g_menu.draw(w, h, menu_view(w, h), g_menu_picture);
+    } else if (g_painted_wheel.open) {
+        const auto &wheel = g_painted_wheel;
+        quickmenu::draw_weapon_wheel(w, h, wheel.selected, wheel.equipped, wheel.available, g_menu_picture);
     } else {
-        quickmenu::Menu::draw_note(w, h, g_note_text, g_menu_picture);
+        const bool notice = !g_note_text.empty();
+        quickmenu::Menu::draw_note(w, h, notice ? g_note_text : g_fps_text, g_menu_picture, notice);
     }
     const quickmenu::Picture &p = g_menu_picture;
 #ifdef PS2_GPU
@@ -921,7 +1333,7 @@ void menu_paint(bool show_again = true) {
         return;
     }
 #endif
-    if (!g_renderer) return;
+    if (!g_renderer || p.rgba.empty()) return;
     if (!g_menu_texture || g_menu_texture_w != p.width || g_menu_texture_h != p.height) {
         if (g_menu_texture) SDL_DestroyTexture(g_menu_texture);
         // ABGR8888 is a packed format: red in the low byte of the 32-bit value, as the panel is made
@@ -962,11 +1374,20 @@ void menu_show_again() {
 
 void open_menu(const char *why) {
     if (g_menu.is_open()) return;
+    cancel_weapon_wheel();
     reload_keys_if_changed();
     g_note_text.clear();
     g_key_note.clear();
+    g_draft = g_settings;
+    g_draft.fullscreen = fullscreen();
     g_menu.open();
-    g_menu.set_key_rows(keymap::kChangeableCount);
+    g_controls_page = ControlsPage::overview;
+    g_quit_armed = false;
+    g_key_capture = g_pad_capture = -1;
+    for (int port = 0; port < 2; ++port) {
+        const int y = g_pads[port] ? SDL_GameControllerGetAxis(g_pads[port], SDL_CONTROLLER_AXIS_LEFTY) : 0;
+        g_stick_step[port] = y < -8000 ? -1 : y > 8000 ? 1 : 0;
+    }
     g_menu_hold.store(true, std::memory_order_release);
     g_menu_opened_ticks = SDL_GetTicks();
     SDL_SetRelativeMouseMode(SDL_FALSE);  // the pointer can click the entries
@@ -982,6 +1403,7 @@ void open_menu(const char *why) {
 void close_menu(const char *why) {
     if (!g_menu.is_open()) return;
     g_menu.close();
+    g_reset_fps_sample = true;
     g_block_input[0] = g_block_input[1] = true;
     menu_paint();  // takes the panel away (shown at once, before the game's next picture)
     SDL_ShowCursor(SDL_DISABLE);
@@ -991,24 +1413,6 @@ void close_menu(const char *why) {
 }
 
 void close_menu_if_open(const char *why) { close_menu(why); }
-
-void set_notice(const std::string &text) {
-    g_notice_text = text;
-    g_notice_until = SDL_GetTicks() + 5000;
-    refresh_title();
-}
-
-// the lines of keys.ini for these buttons, written with the keys now in force (comments and every other line stay as they are)
-void write_key_lines(const std::vector<int> &actions) {
-    if (actions.empty()) return;
-    rewrite_keys_file(
-        [&](const std::string &text) {
-            std::string out = text;
-            for (int a : actions) out = keymap::with_inputs(out, a, g_keys.inputs[a]);
-            return out;
-        },
-        "new keys");
-}
 
 // the key card's and the menu's idea of a mouse button
 int mouse_input(Uint8 button) {
@@ -1022,52 +1426,90 @@ int mouse_input(Uint8 button) {
     }
 }
 
-// The keys page waits for a key: the next key or mouse button (wheel too) is the highlighted button's new key. Esc or a controller button
-// cancels. Always true for the events that belong to input (nothing reaches the game).
+void cancel_capture() {
+    g_key_capture = g_pad_capture = -1;
+    g_key_note.clear();
+    menu_paint();
+}
+
 bool capture_event(const SDL_Event &e) {
-    int input = 0;
-    switch (e.type) {
-    case SDL_KEYDOWN:
-        if (e.key.repeat) return true;
-        if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
-            g_menu.stop_capture();
-            g_key_note = "Nothing changed.";
-            menu_paint();
-            return true;
-        }
-        input = e.key.keysym.scancode;
-        break;
-    case SDL_MOUSEBUTTONDOWN: input = mouse_input(e.button.button); break;
-    case SDL_MOUSEWHEEL: input = e.wheel.y > 0 ? keymap::kWheelUp : e.wheel.y < 0 ? keymap::kWheelDown : 0; break;
-    case SDL_CONTROLLERBUTTONDOWN:
-        g_menu.stop_capture();
-        g_key_note = "Nothing changed.";
-        menu_paint();
+    if (g_pad_capture == kWheelCapture && e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_BACKSPACE) {
+        g_draft.pad.weapon_wheel = -1;
+        cancel_capture();
         return true;
-    case SDL_KEYUP: case SDL_MOUSEBUTTONUP: case SDL_MOUSEMOTION: case SDL_CONTROLLERBUTTONUP: case SDL_CONTROLLERAXISMOTION: return true;
+    }
+    if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+        cancel_capture();
+        return true;
+    }
+    if (g_key_capture >= 0) {
+        int input = 0;
+        switch (e.type) {
+        case SDL_KEYDOWN: if (!e.key.repeat) input = e.key.keysym.scancode; break;
+        case SDL_MOUSEBUTTONDOWN: input = mouse_input(e.button.button); break;
+        case SDL_MOUSEWHEEL: input = e.wheel.y > 0 ? keymap::kWheelUp : e.wheel.y < 0 ? keymap::kWheelDown : 0; break;
+        default: break;
+        }
+        if (input) {
+            auto keys = rexsettings::keyboard(g_draft, g_legacy_keys);
+            const auto uses = [&](int action) {
+                const auto &v = keys.inputs[action];
+                return std::find(v.begin(), v.end(), input) != v.end();
+            };
+            if (uses(keymap::Help) || uses(keymap::Menu)) {
+                g_key_note = "Esta tecla está reservada a um atalho de keys.ini.";
+            } else {
+                std::vector<int> changed;
+                if (keymap::assign_input(keys, g_key_capture, input, changed, g_key_note)) {
+                    for (int action : changed) g_draft.keys[action] = keys.inputs[action];
+                    g_key_capture = -1;
+                }
+            }
+            menu_paint();
+        }
+    } else if (e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERAXISMOTION) {
+        const auto id = e.type == SDL_CONTROLLERBUTTONDOWN ? e.cbutton.which : e.caxis.which;
+        for (int port = 0; port < 2; ++port) {
+            if (!g_pads[port] || SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[port])) != id) continue;
+            int input = -1;
+            if (e.type == SDL_CONTROLLERBUTTONDOWN) input = e.cbutton.button;
+            else if (e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
+                const int trigger = e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? 0 : 1;
+                auto &ready = g_trigger_capture_ready[port][trigger];
+                ready |= e.caxis.value <= kTriggerThreshold;
+                if (ready && e.caxis.value > 12000) input = rexsettings::kLeftTrigger + trigger;
+            }
+            if (input >= 0) {
+                const bool assigned = g_pad_capture == kWheelCapture
+                    ? rexsettings::assign_weapon_wheel(g_draft.pad, input, g_key_note)
+                    : rexsettings::assign_pad(g_draft.pad, g_pad_capture, input, g_key_note);
+                if (assigned) g_pad_capture = -1;
+                menu_paint();
+            }
+            break;
+        }
+    }
+    switch (e.type) {
+    case SDL_KEYDOWN: case SDL_KEYUP: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: case SDL_MOUSEWHEEL:
+    case SDL_MOUSEMOTION: case SDL_CONTROLLERBUTTONDOWN: case SDL_CONTROLLERBUTTONUP: case SDL_CONTROLLERAXISMOTION: return true;
     default: return false;
     }
-    if (input == 0) return true;
-    std::vector<int> changed;
-    std::string message;
-    const int action = g_menu.key_row();
-    if (!keymap::assign_input(g_keys, action, input, changed, message)) {
-        g_key_note = message;  // (it stays waiting)
-    } else {
-        g_menu.stop_capture();
-        g_key_note = message;
-        write_key_lines(changed);
-        std::fprintf(stderr, "[menu] keys: %s\n", message.c_str());
-    }
-    menu_paint();
-    return true;
 }
 
 // what an entry does; step is -1 or 1 for left and right (Enter and a click go forward)
-void menu_command(quickmenu::Command c, int step) {
+void menu_command(quickmenu::Selection choice) {
     using quickmenu::Command;
-    switch (c) {
-    case Command::none: menu_paint(); return;  // (Quit asked once: the entry shows the question)
+    const int step = choice.step;
+    if (choice.command != Command::quit) g_quit_armed = false;
+    switch (choice.command) {
+    case Command::none: menu_paint(); return;
+    case Command::apply:
+        if (apply_preferences()) {
+            close_menu("Apply settings");
+            return;
+        }
+        break;
+    case Command::cancel:
     case Command::resume: close_menu("Resume"); return;
     case Command::save:
         close_menu("Quick save");
@@ -1079,45 +1521,104 @@ void menu_command(quickmenu::Command c, int step) {
         g_note_wanted = true;
         ps2::quick_request(ps2::QuickKey::load);
         return;
-    case Command::look: cycle_look(step); break;
+    case Command::report:
+        close_menu("F9");
+        ps2::quick_request(ps2::QuickKey::report);
+        return;
+    case Command::look:
+        g_draft.look = next_look(picture_look(g_draft), step);
+        break;
+    case Command::renderer: cycle_renderer(step); break;
     case Command::scale:
-        if (g_scale_locked) {
-            set_notice("The resolution is set by PS2_SCALE; remove it to choose here");
-            break;
-        }
-        g_scale_next = (g_scale_next - 1 + step + 4) % 4 + 1;
-        g_keys.scale = g_scale_next;
-        rewrite_keys_file([](const std::string &t) { return keymap::with_scale(t, g_scale_next); }, "resolution");
-        set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_next == g_scale_now ? "" : ": used when the game starts the next time"));
-        std::fprintf(stderr, "[menu] resolution %dx for the next start (this run: %dx)\n", g_scale_next, g_scale_now);
+        g_draft.scale = (internal_scale(g_draft) - 1 + step + 4) % 4 + 1;
         break;
     case Command::sharp_2d:
-        if (g_sharp_locked) {
-            set_notice("Text and menus are set by PS2_SHARP_2D; remove it to choose here");
-            break;
-        }
-        g_sharp_next = (g_sharp_next + step + 3) % 3;
-        g_keys.sharp_2d = g_sharp_next;
-        rewrite_keys_file([](const std::string &t) { return keymap::with_sharp_2d(t, g_sharp_next); }, "2D art filter");
-        set_notice(std::string("Text and menus: ") + keymap::sharp_2d_word(g_sharp_next) + (g_sharp_next == g_sharp_now ? "" : ", used when the game starts the next time"));
-        std::fprintf(stderr, "[menu] 2D art %s for the next start (this run: %s)\n", keymap::sharp_2d_word(g_sharp_next), keymap::sharp_2d_word(g_sharp_now));
+        g_draft.sharp_2d = (art_filter(g_draft) + step + 3) % 3;
         break;
-    case Command::fullscreen: toggle_fullscreen(); break;
-    case Command::change_keys: g_key_note.clear(); break;  // (the menu has switched to its keys page)
-    case Command::key_edit: g_key_note.clear(); break;     // (the highlighted line waits for a key now)
-    case Command::key_defaults: {
-        std::vector<int> changed;
-        keymap::restore_default_inputs(g_keys, changed);
-        write_key_lines(changed);
-        g_key_note = changed.empty() ? "These are the default keys already." : "The default keys are back.";
-        std::fprintf(stderr, "[menu] the default keys are back (%zu button%s changed)\n", changed.size(), changed.size() == 1 ? "" : "s");
+    case Command::fullscreen: g_draft.fullscreen = !g_draft.fullscreen; break;
+    case Command::sync: {
+        const int count = immediate_present_available() ? 3 : 2;
+        g_draft.sync = static_cast<Sync>((static_cast<int>(g_draft.sync) + step + count) % count);
         break;
     }
+    case Command::fps: g_draft.fps = !g_draft.fps; break;
+    case Command::current_field: {
+        const int count = dual_motion_fields_available() ? 5 : motion_fields_available() ? 4 : g_gpu_present ? 3 : 2;
+        const bool motion_requested = g_draft.motion_fields || g_draft.dual_motion_fields;
+        int mode = 0;
+        if (g_draft.current_field) mode = 1;
+        else if (count == 5 && g_draft.dual_motion_fields) mode = 4;
+        else if (count >= 4 && motion_requested) mode = 3;
+        else if (g_gpu_present && (g_draft.align_fields || motion_requested)) mode = 2;
+        const int next = (mode + step + count) % count;
+        g_draft.current_field = next == 1;
+        g_draft.align_fields = next >= 2;
+        g_draft.motion_fields = next >= 3;
+        g_draft.dual_motion_fields = next == 4;
+        break;
+    }
+    case Command::area_reduction: g_draft.area_reduction = !g_draft.area_reduction; break;
+    case Command::anti_aliasing:
+        g_draft.anti_aliasing = static_cast<rexsettings::AntiAliasing>((static_cast<int>(g_draft.anti_aliasing) + step + 3) % 3);
+        break;
+    case Command::cas: g_draft.cas = !g_draft.cas; break;
+    case Command::cas_strength: g_draft.cas_strength = std::clamp(g_draft.cas_strength + 5 * step, 0, 100); break;
+    case Command::keyboard:
+    case Command::gamepad:
+        g_controls_page = choice.command == Command::keyboard ? ControlsPage::keyboard : ControlsPage::gamepad;
+        g_menu.reset_selection();
+        g_key_note.clear();
+        break;
+    case Command::key_edit:
+        g_key_capture = choice.index;
+        g_key_note.clear();
+        break;
+    case Command::wheel_pad:
+    case Command::pad_edit:
+        g_pad_capture = choice.command == Command::wheel_pad ? kWheelCapture : choice.index;
+        g_key_note.clear();
+        for (int port = 0; port < 2; ++port)
+            for (int t = 0; t < 2; ++t)
+                g_trigger_capture_ready[port][t] = g_pads[port] && trigger_value(g_pads[port], rexsettings::kLeftTrigger + t) <= kTriggerThreshold;
+        break;
+    case Command::weapon_switch:
+        g_draft.pad.weapon_switch = static_cast<WeaponSwitch>((3 + static_cast<int>(g_draft.pad.weapon_switch) + step) % 3);
+        break;
+    case Command::deadzone:
+        g_draft.pad.deadzone = std::clamp(g_draft.pad.deadzone + 5 * step, 0, 40);
+        break;
+    case Command::sensitivity:
+        g_draft.pad.sensitivity = std::clamp(g_draft.pad.sensitivity + 10 * step, 50, 150);
+        break;
+    case Command::left_reference_gain: g_draft.pad.left_reference_gain = !g_draft.pad.left_reference_gain; break;
+    case Command::invert: g_draft.pad.invert[choice.index] = !g_draft.pad.invert[choice.index]; break;
+    case Command::rumble: g_draft.pad.rumble = !g_draft.pad.rumble; break;
+    case Command::reset_keys:
+        g_draft.default_keys = true;
+        g_draft.keys = {};
+        g_key_note = "Teclado padrão selecionado. Use Aplicar para salvar.";
+        break;
+    case Command::reset_pad:
+        g_draft.pad = {};
+        g_key_note = "Gamepad padrão selecionado. Use Aplicar para salvar.";
+        break;
+    case Command::defaults:
+        g_draft = {};
+        g_draft.default_keys = true;
+        g_draft.scale = 1;
+        g_draft.sharp_2d = 1;
+        g_draft.look = keymap::kDefaultLook;
+        g_key_note = "Padrões selecionados. Use Aplicar para salvar.";
+        break;
     case Command::keys:
         // the menu stays open behind the card (the game keeps holding); the card's own buttons close it when they save or load
         show_key_card("Keys in the quick menu");
         break;
     case Command::quit:
+        if (!g_quit_armed) {
+            g_quit_armed = true;
+            break;
+        }
         std::fprintf(stderr, "[menu] Quit the game: the memory card is written, the game ends\n");
         ps2::flush_memory_card();  // right away, as when the window is closed
         ps2::halt("quit from the quick menu");
@@ -1138,17 +1639,20 @@ bool is_menu_key(SDL_Scancode k) {
 }
 
 // the pointer in window pixels (events can be in the SDL renderer's logical units; the mouse state is not)
-bool menu_pointer_select() {
-    int x = 0, y = 0, ww = 1, wh = 1, pw = 0, ph = 0;
+void menu_pointer(int &x, int &y) {
+    int ww = 1, wh = 1, pw = 0, ph = 0;
     SDL_GetMouseState(&x, &y);
     SDL_GetWindowSize(g_window, &ww, &wh);
     window_pixels(pw, ph);
-    return g_menu.select_at(x * pw / std::max(ww, 1), y * ph / std::max(wh, 1));
+    x = x * pw / std::max(ww, 1);
+    y = y * ph / std::max(wh, 1);
 }
 
-// Keys, buttons and the mouse for the menu. True when the event was the menu's (while it is open every key and button is).
 bool menu_event(const SDL_Event &e) {
     using quickmenu::Command;
+    if (g_focus_suspended && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP || e.type == SDL_MOUSEBUTTONDOWN ||
+                              e.type == SDL_MOUSEBUTTONUP || e.type == SDL_MOUSEMOTION || e.type == SDL_MOUSEWHEEL ||
+                              e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP || e.type == SDL_CONTROLLERAXISMOTION)) return true;
     if (!g_menu.is_open()) {
         if (e.type == SDL_KEYDOWN && !e.key.repeat && is_menu_key(e.key.keysym.scancode)) {
             open_menu((std::string("key ") + SDL_GetScancodeName(e.key.keysym.scancode)).c_str());
@@ -1166,48 +1670,63 @@ bool menu_event(const SDL_Event &e) {
         }
         return false;
     }
-    const auto side = [](int step) { menu_command(g_menu.side(), step); };
+
     const auto move = [](int step) {
+        g_quit_armed = false;
+        g_key_note.clear();
         g_menu.move(step);
         menu_paint();
     };
-    // Esc, Circle, the right mouse button: one page back on the keys page, else the menu closes
-    const auto back = [](const char *why) {
-        if (g_menu.back()) menu_paint();
-        else close_menu(why);
+    const auto tab = [](int step) {
+        g_controls_page = ControlsPage::overview;
+        g_quit_armed = false;
+        g_key_note.clear();
+        g_menu.switch_tab(step);
+        menu_paint();
     };
-    if (g_menu.capturing()) return capture_event(e);
-    switch (e.type) {
-    case SDL_KEYDOWN: {
-        const SDL_Scancode k = e.key.keysym.scancode;
-        if (!e.key.repeat && is_menu_key(k)) {
-            close_menu("its key");
+    const auto back = [](const char *why) {
+        if (g_controls_page == ControlsPage::overview) close_menu(why);
+        else {
+            g_controls_page = ControlsPage::overview;
+            g_menu.reset_selection();
+            g_key_note.clear();
+            menu_paint();
+        }
+    };
+    // Keep the program's shortcuts reachable even while a row is capturing a binding.
+    if (e.type == SDL_KEYDOWN && !e.key.repeat) {
+        const auto k = e.key.keysym.scancode;
+        if (is_menu_key(k)) { close_menu("its key"); return true; }
+        if (k == SDL_SCANCODE_F5) { menu_command({Command::save}); return true; }
+        if (k == SDL_SCANCODE_F8) { menu_command({Command::load}); return true; }
+        if (k == SDL_SCANCODE_F9) { menu_command({Command::report}); return true; }
+        if (k == SDL_SCANCODE_F11) { toggle_fullscreen(); menu_paint(); return true; }
+        if ((k == SDL_SCANCODE_RETURN || k == SDL_SCANCODE_KP_ENTER) && (e.key.keysym.mod & KMOD_CTRL) && g_key_capture < 0 && g_pad_capture < 0) {
+            menu_command({Command::apply});
             return true;
         }
+    }
+    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
+        close_menu("the Guide button");
+        return true;
+    }
+    if (g_key_capture >= 0 || g_pad_capture >= 0) return capture_event(e);
+    switch (e.type) {
+    case SDL_KEYDOWN: {
+        const auto k = e.key.keysym.scancode;
         switch (k) {
         case SDL_SCANCODE_UP: case SDL_SCANCODE_W: move(-1); break;
         case SDL_SCANCODE_DOWN: case SDL_SCANCODE_S: move(1); break;
-        case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: side(-1); break;
-        case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: side(1); break;
+        case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: menu_command(g_menu.side(-1)); break;
+        case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: menu_command(g_menu.side(1)); break;
+        case SDL_SCANCODE_TAB: if (!e.key.repeat) tab(e.key.keysym.mod & KMOD_SHIFT ? -1 : 1); break;
         case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE:
-            if (!e.key.repeat) menu_command(g_menu.choose(), 1);
+            if (!e.key.repeat) menu_command(g_menu.choose());
             break;
-        case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_BACKSPACE:
-            if (!e.key.repeat) back(k == SDL_SCANCODE_ESCAPE ? "Esc" : "Backspace");
-            break;
-        // the program's keys keep working; those that need the game running close the menu first
-        case SDL_SCANCODE_F2: if (!e.key.repeat) menu_command(Command::look, 1); break;
-        case SDL_SCANCODE_F5: if (!e.key.repeat) menu_command(Command::save, 1); break;
-        case SDL_SCANCODE_F8: if (!e.key.repeat) menu_command(Command::load, 1); break;
-        case SDL_SCANCODE_F9:
-            if (!e.key.repeat) {
-                close_menu("F9");
-                ps2::quick_request(ps2::QuickKey::report);
-            }
-            break;
-        case SDL_SCANCODE_F11: if (!e.key.repeat) menu_command(Command::fullscreen, 1); break;
+        case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_BACKSPACE: if (!e.key.repeat) back("Esc / Backspace"); break;
+        case SDL_SCANCODE_F2: if (!e.key.repeat) { cycle_look(); menu_paint(); } break;
         default:
-            if (!e.key.repeat && is_help_key(k)) menu_command(Command::keys, 1);
+            if (!e.key.repeat && is_help_key(k)) menu_command({Command::keys});
             break;
         }
         return true;
@@ -1217,11 +1736,13 @@ bool menu_event(const SDL_Event &e) {
         switch (e.cbutton.button) {
         case SDL_CONTROLLER_BUTTON_DPAD_UP: move(-1); break;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: move(1); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: side(-1); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: side(1); break;
-        case SDL_CONTROLLER_BUTTON_A: menu_command(g_menu.choose(), 1); break;  // Cross (the bottom button)
-        case SDL_CONTROLLER_BUTTON_B: back("Circle"); break;              // Circle (the right one)
-        case SDL_CONTROLLER_BUTTON_GUIDE: close_menu("the Guide button"); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: menu_command(g_menu.side(-1)); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: menu_command(g_menu.side(1)); break;
+        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: tab(-1); break;
+        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: tab(1); break;
+        case SDL_CONTROLLER_BUTTON_A: menu_command(g_menu.choose()); break;
+        case SDL_CONTROLLER_BUTTON_Y: menu_command({Command::apply}); break;
+        case SDL_CONTROLLER_BUTTON_B: back("controller cancel"); break;
         case SDL_CONTROLLER_BUTTON_START: close_menu("Start"); break;
         default: break;
         }
@@ -1229,21 +1750,40 @@ bool menu_event(const SDL_Event &e) {
     case SDL_CONTROLLERBUTTONUP: return true;
     case SDL_CONTROLLERAXISMOTION:
         if (e.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
-            // the left stick moves the highlight once per push
             int &was = g_stick_step[g_pads[1] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[1])) == e.caxis.which ? 1 : 0];
             const int now = e.caxis.value < -20000 ? -1 : e.caxis.value > 20000 ? 1 : (std::abs(e.caxis.value) < 8000 ? 0 : was);
             if (now && now != was) move(now);
             was = now;
         }
         return true;
-    case SDL_MOUSEMOTION:
-        if ((e.motion.xrel || e.motion.yrel) && menu_pointer_select()) menu_paint();  // only a pointer that moved (not one that the window moved under)
+    case SDL_MOUSEMOTION: {
+        int x = 0, y = 0;
+        menu_pointer(x, y);
+        const bool changed_button = g_menu.pointer_at(x, y, false);
+        if ((e.motion.xrel || e.motion.yrel) && g_menu.select_at(x, y)) {
+            g_quit_armed = false;
+            g_key_note.clear();
+            menu_paint();
+        } else if (changed_button) menu_paint();
         return true;
+    }
     case SDL_MOUSEBUTTONDOWN:
-        if (e.button.button == SDL_BUTTON_LEFT && menu_pointer_select()) menu_command(g_menu.choose(), 1);
-        else if (e.button.button == SDL_BUTTON_RIGHT) back("the right mouse button");
+        if (e.button.button == SDL_BUTTON_LEFT) {
+            int x = 0, y = 0;
+            menu_pointer(x, y);
+            g_menu.pointer_at(x, y, true);
+            const auto before = g_menu.tab();
+            const auto choice = g_menu.click(x, y);
+            if (g_menu.tab() != before) {
+                g_controls_page = ControlsPage::overview;
+                g_key_note.clear();
+            }
+            menu_command(choice);
+        } else if (e.button.button == SDL_BUTTON_RIGHT) back("right mouse button");
         return true;
-    case SDL_MOUSEBUTTONUP: return true;
+    case SDL_MOUSEBUTTONUP:
+        if (e.button.button == SDL_BUTTON_LEFT && g_menu.release_pointer()) menu_paint();
+        return true;
     case SDL_MOUSEWHEEL:
         if (e.wheel.y) move(e.wheel.y > 0 ? -1 : 1);
         return true;
@@ -1300,6 +1840,140 @@ struct EventTimer {
     }
 };
 
+void remember_l2_event(const SDL_Event &e) {
+    auto *pad = g_pads[0];
+    if (!pad || g_settings.pad.weapon_switch != WeaponSwitch::radial) return;
+    const int input = g_settings.pad.buttons[kL2Bit];
+    const auto id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+    if (e.type == SDL_CONTROLLERAXISMOTION && e.caxis.which == id &&
+        ((input == rexsettings::kLeftTrigger && e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT) ||
+         (input == rexsettings::kRightTrigger && e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)))
+        g_l2_event_time = e.caxis.timestamp;
+    if ((e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP) &&
+        e.cbutton.which == id && e.cbutton.button == input)
+        g_l2_event_time = e.cbutton.timestamp;
+}
+
+void trace_l2(const char *event, int value) {
+    const auto elapsed = SDL_GetTicks() - g_l2_event_time;
+    std::fprintf(stderr, "[wheel-input] %s f=%llu ms=%llu event_age_ms=%d value=%d\n", event,
+                 static_cast<unsigned long long>(ps2::frames_run()), static_cast<unsigned long long>(SDL_GetTicks64()),
+                 g_l2_event_time && elapsed <= 250 ? static_cast<int>(elapsed) : -1, value);
+}
+
+void poll_l2_wheel() {
+    auto *pad = g_pads[0];
+    if (g_settings.pad.weapon_switch != WeaponSwitch::radial || g_menu.is_open() || g_focus_suspended ||
+        !pad || !SDL_GameControllerGetAttached(pad)) {
+        if (g_wheel_l2 == WheelL2::holding) cancel_weapon_wheel();
+        g_wheel_l2 = WheelL2::wait_for_release;
+        return;
+    }
+
+    const int input = g_settings.pad.buttons[kL2Bit];
+    const int value = pad_control_value(pad, input);
+    // If B itself is bound to L2, the separate Circle binding can cancel the hold.
+    const int circle = g_settings.pad.buttons[kCircleBit];
+    if (g_wheel_l2 == WheelL2::holding && input == SDL_CONTROLLER_BUTTON_B &&
+        pad_control_value(pad, circle) > kTriggerThreshold) {
+        g_wheel_cancel_input = circle;
+        cancel_weapon_wheel();
+        return;
+    }
+    if (value <= kTriggerThreshold) {
+        if (g_wheel_l2 == WheelL2::holding) {
+            trace_l2("release", value);
+            g_wheel_device = -1;
+            g_weapon_wheel.release();
+        }
+        g_wheel_l2 = WheelL2::ready;
+        return;
+    }
+
+    if (g_wheel_l2 != WheelL2::ready || value <= kWheelPressThreshold) return;
+    g_wheel_l2 = WheelL2::wait_for_release;  // A blocked press stays consumed through release.
+    trace_l2("press", value);
+    if (!open_weapon_wheel()) return;
+    trace_l2("open", value);
+
+    g_wheel_l2 = WheelL2::holding;
+    g_wheel_keyboard = false;
+    g_wheel_device = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+    g_wheel_button = -1;  // The mapped L2 release is sampled here.
+    g_weapon_wheel.stick(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY));
+}
+
+bool weapon_wheel_event(const SDL_Event &event) {
+    if (g_menu.is_open() || g_focus_suspended || g_settings.pad.weapon_switch == WeaponSwitch::dpad) return false;
+    const bool keyboard = event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
+    const auto key = keyboard ? event.key.keysym.scancode : SDL_SCANCODE_UNKNOWN;
+    if (keyboard && key == SDL_SCANCODE_F3) {
+        if (event.type == SDL_KEYUP && g_wheel_keyboard) {
+            g_wheel_keyboard = false;
+            g_weapon_wheel.release();
+            return true;
+        }
+        const bool assigned = std::any_of(std::begin(g_keys.inputs), std::end(g_keys.inputs), [](const auto &keys) {
+            return std::find(keys.begin(), keys.end(), SDL_SCANCODE_F3) != keys.end();
+        });
+        if (!assigned && g_weapon_wheel.supported()) {
+            if (event.type == SDL_KEYDOWN && !event.key.repeat && open_weapon_wheel()) {
+                g_wheel_keyboard = true;
+                g_wheel_device = -1;
+            }
+            return true;
+        }
+    }
+
+    auto *pad = g_pads[0];
+    const auto port_one = pad ? SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) : -1;
+    const bool button = event.type == SDL_CONTROLLERBUTTONDOWN || event.type == SDL_CONTROLLERBUTTONUP;
+    if (button && event.cbutton.which == port_one) {
+        const int input = event.cbutton.button;
+        if (event.type == SDL_CONTROLLERBUTTONUP && event.cbutton.which == g_wheel_device && input == g_wheel_button) {
+            g_wheel_device = -1;
+            g_weapon_wheel.release();
+            return true;
+        }
+        if (input == g_settings.pad.weapon_wheel && rexsettings::weapon_wheel_button(g_settings.pad, input) &&
+            g_weapon_wheel.supported()) {
+            if (event.type == SDL_CONTROLLERBUTTONDOWN && open_weapon_wheel()) {
+                g_wheel_keyboard = false;
+                g_wheel_device = port_one;
+                g_wheel_button = input;
+            }
+            return true;
+        }
+    }
+    if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.which == port_one &&
+        event.cbutton.button == SDL_CONTROLLER_BUTTON_B && g_weapon_wheel.can_cancel()) {
+        g_wheel_cancel_input = SDL_CONTROLLER_BUTTON_B;
+        cancel_weapon_wheel();
+        return true;
+    }
+    if (event.type == SDL_KEYDOWN && key == SDL_SCANCODE_ESCAPE && g_weapon_wheel.can_cancel()) {
+        cancel_weapon_wheel();
+        return true;
+    }
+    if (!g_weapon_wheel.view().open) return false;
+    if (event.type == SDL_KEYDOWN && !event.key.repeat) {
+        switch (key) {
+        case SDL_SCANCODE_UP: g_weapon_wheel.select(0); return true;
+        case SDL_SCANCODE_RIGHT: g_weapon_wheel.select(1); return true;
+        case SDL_SCANCODE_LEFT: g_weapon_wheel.select(2); return true;
+        case SDL_SCANCODE_DOWN: g_weapon_wheel.select(3); return true;
+        default: break;
+        }
+    }
+    if (pad && event.type == SDL_CONTROLLERAXISMOTION && event.caxis.which == port_one &&
+        (event.caxis.axis == SDL_CONTROLLER_AXIS_RIGHTX || event.caxis.axis == SDL_CONTROLLER_AXIS_RIGHTY)) {
+        g_weapon_wheel.stick(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX),
+                             SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY));
+        return true;
+    }
+    return false;
+}
 void poll() {
     window_stage("window thread: starting a pass of poll()");
     if (!g_script.empty()) play_pad_script();
@@ -1314,7 +1988,8 @@ void poll() {
             ps2::halt("window closed");
             close_menu("the window was closed");  // a game that waits for the menu must go on to see the halt
         }
-        if (menu_event(e)) continue;
+        remember_l2_event(e);
+        if (menu_event(e) || weapon_wheel_event(e)) continue;
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat) toggle_fullscreen();
         // F1 the quick menu (menu_event), F5 quick save, F8 quick load, F9 "something is wrong here" (the game's own buttons: keys.ini,
         // host/keymap.cpp); a help key of the player's own shows the key card at once
@@ -1334,6 +2009,11 @@ void poll() {
         if (e.type == SDL_WINDOWEVENT && (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_EXPOSED) && g_overlay_on)
             menu_paint();  // the panel for the new size
         if (e.type == SDL_WINDOWEVENT && (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED || e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)) {
+            g_focus_suspended = e.window.event == SDL_WINDOWEVENT_FOCUS_LOST;
+            g_block_input[0] = g_block_input[1] = true;
+            if (g_focus_suspended) cancel_weapon_wheel();
+            if (g_focus_suspended && g_menu.release_pointer() && g_menu.is_open()) menu_paint();
+            if (g_focus_suspended && (g_key_capture >= 0 || g_pad_capture >= 0)) cancel_capture();
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
                 g_focus_gained_ticks = SDL_GetTicks();
                 reload_keys_if_changed();
@@ -1348,16 +2028,29 @@ void poll() {
             // a turn of the wheel is a press of about a tenth of a second, which the game sees for a few frames
             (e.wheel.y > 0 ? g_wheel_up_until : g_wheel_down_until) = SDL_GetTicks() + 100;
         }
-        if (e.type == SDL_CONTROLLERDEVICEADDED) open_pad(e.cdevice.which);
-        if (e.type == SDL_CONTROLLERDEVICEREMOVED) close_pad(e.cdevice.which);
+        if (e.type == SDL_CONTROLLERDEVICEADDED) {
+            open_pad(e.cdevice.which);
+            if (g_menu.is_open()) menu_paint();
+        }
+        if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
+            if (e.cdevice.which == g_wheel_device) cancel_weapon_wheel();
+            close_pad(e.cdevice.which);
+            if (g_menu.is_open()) {
+                if (g_pad_capture >= 0 && !g_pads[0] && !g_pads[1]) cancel_capture();
+                else menu_paint();
+            }
+        }
         if (e.type == SDL_JOYDEVICEADDED && !SDL_IsGameController(e.jdevice.which))
             std::fprintf(stderr, "[pad] %s is not used: SDL knows no button layout for it (docs/sound-pad.md: gamecontrollerdb.txt)\n",
                          or_unknown(SDL_JoystickNameForIndex(e.jdevice.which)));
     }
     window_stage("reading the controllers");
     const auto after_events = ps2::hitch::on() ? ps2::hitch::Clock::now() : ps2::hitch::Clock::time_point{};
+    // Check for focus loss, cancellation and detach events before accepting a release.
+    poll_l2_wheel();
     poll_port(0);
     poll_port(1);
+    if (g_weapon_wheel.view() != g_painted_wheel) menu_paint();
     show_notice();
     if (g_menu_redraw) menu_show_again();
     if (ps2::hitch::on() && ps2::hitch::ms_since(after_events) > ps2::hitch::threshold_ms() / 3)
@@ -1524,7 +2217,9 @@ void show_speed() {
     static std::uint64_t start = 0, frames = 0;
     static double cpu_start = 0.0, gpu_start = 0.0;
     const std::uint64_t now = SDL_GetPerformanceCounter();
-    if (!start) {
+    if (!start || g_reset_fps_sample) {
+        g_reset_fps_sample = false;
+        frames = 0;
         start = now;
         cpu_start = process_cpu_seconds();
         gpu_start = ps2::gpu_busy_ms();
@@ -1541,6 +2236,12 @@ void show_speed() {
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued, stretched);
     g_speed_title = title;
     refresh_title();
+    if (g_settings.fps && !g_menu.is_open()) {
+        char fps[64];
+        std::snprintf(fps, sizeof fps, "%.1f FPS   %.1f ms", frames / seconds, seconds * 1000.0 / frames);
+        g_fps_text = fps;
+        if (g_note_text.empty()) menu_paint(false);
+    }
     start = now;
     frames = 0;
     cpu_start = cpu;
@@ -1603,6 +2304,7 @@ struct FrameLog {
 FrameLog g_frame_log;
 
 void on_vblank() {
+    g_weapon_wheel.frame();
     show_speed();
     poll();
     present();
@@ -1833,31 +2535,35 @@ bool open_window(bool fullscreen) {
     if (!script.empty()) load_pad_script(script);
     g_keys_path = ps2::os::env("PS2_KEYS");
     if (g_keys_path.empty()) g_keys_path = ps2::quick_folder("keys.ini");  // next to the memory card, like the quick saves
+    g_settings_path = ps2::quick_folder("rex-settings.ini");
+    g_settings = rexsettings::load(g_settings_path);
+    g_current_field_forced = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     if (const std::string word = ps2::os::env("PS2_LOOK"); !word.empty()) {
         for (int i = 0; i < keymap::kLookCount; ++i)
             if (word == keymap::look_word(i) || word == std::to_string(i)) g_look = i, g_look_forced = true;
         if (!g_look_forced) std::fprintf(stderr, "[video] PS2_LOOK=%s is not crisp, crisp_edges, soft, soft_edges, sharp, sharp_edges or 0 to 5, ignored\n", word.c_str());
     }
     load_keys();
-    // The inner resolution: PS2_SCALE when it is set, else the 'scale' line of keys.ini (the quick menu writes it), else 1. It is read
-    // when the graphics start (run_window, after this), so setting it here is in time.
+    g_renderer_locked = !ps2::os::env("PS2_GS").empty() || !ps2::os::env("PS2_GPU_BACKEND").empty();
     g_scale_locked = !ps2::os::env("PS2_SCALE").empty();
-    if (!g_scale_locked && g_keys.scale >= 1 && g_keys.scale <= 4) {
-        ps2::os::set_env("PS2_SCALE", std::to_string(g_keys.scale));
-        std::fprintf(stderr, "[video] resolution %dx from %s (scale = %d)\n", g_keys.scale, g_keys_path.c_str(), g_keys.scale);
+    g_sharp_locked = !ps2::os::env("PS2_SHARP_2D").empty();
+    g_sync_locked = !ps2::os::env("PS2_PRESENT_MODE").empty();
+    if (!g_renderer_locked) {
+        if (g_settings.renderer == Renderer::cpu) ps2::os::set_env("PS2_GS", "cpu");
+#ifdef PS2_GPU
+        else if (g_settings.renderer != Renderer::automatic) ps2::os::set_env("PS2_GPU_BACKEND", rexsettings::renderer_word(g_settings.renderer));
+#endif
     }
-    // The picture pace (ps2/pace.hpp): the 'pace' line of keys.ini, unless PS2_PACE is set. The runtime reads it at boot, after this.
+    if (!g_scale_locked && (g_settings.scale || g_keys.scale)) ps2::os::set_env("PS2_SCALE", std::to_string(internal_scale(g_settings)));
+    if (!g_sharp_locked && (g_settings.sharp_2d >= 0 || g_keys.sharp_2d >= 0)) ps2::os::set_env("PS2_SHARP_2D", std::to_string(art_filter(g_settings)));
+    if (!g_sync_locked && g_settings.sync != Sync::automatic) ps2::os::set_env("PS2_PRESENT_MODE", rexsettings::sync_word(g_settings.sync));
+    g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
+    // The 'pace' line of keys.ini is read by the existing runtime pacing.
     if (!g_keys.pace.empty() && ps2::os::env("PS2_PACE").empty()) {
         ps2::os::set_env("PS2_PACE", g_keys.pace);
         ps2::os::set_env("PS2_PACE_FROM", g_keys_path);
     }
-    g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
-    g_scale_next = g_scale_locked ? g_scale_now : (g_keys.scale >= 1 ? g_keys.scale : g_scale_now);
-    // the 2D art filter the same way: PS2_SHARP_2D, else the 'sharp_2d' line of keys.ini, else sharp (gpu.cpp reads it at its start)
-    g_sharp_locked = !ps2::os::env("PS2_SHARP_2D").empty();
-    if (!g_sharp_locked && g_keys.sharp_2d >= 0) ps2::os::set_env("PS2_SHARP_2D", std::to_string(g_keys.sharp_2d));
-    g_sharp_now = ps2::os::env("PS2_SHARP_2D").empty() ? 1 : std::clamp(std::atoi(ps2::os::env("PS2_SHARP_2D").c_str()), 0, 2);
-    g_sharp_next = g_sharp_locked ? g_sharp_now : (g_keys.sharp_2d >= 0 ? g_keys.sharp_2d : g_sharp_now);
+    fullscreen = fullscreen || g_settings.fullscreen;
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 #ifdef __APPLE__
     if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_METAL;
@@ -2031,10 +2737,17 @@ void watchdog() {
 }  // namespace
 #endif
 
+#ifdef PS2_MAXIMO_STYLE_SWITCH
+bool maximo::weapon_equipment_point(ps2::Cpu &cpu, std::uint32_t depth) {
+    return g_weapon_wheel.equipment_point(cpu, depth);
+}
+#endif
+
 int run_window(const std::function<int()> &emulate) {
     ps2::init_graphics();
     g_gpu_present = attach_gpu();
-    std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
+    std::fprintf(stderr, "[window] %s, GS %s %dx\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL",
+                 renderer_name(), std::string_view(renderer_name()) == "CPU" ? 1 : g_scale_now);
     if (!g_gpu_present && !create_renderer()) return 1;
     const bool threads = !std::getenv("PS2_ONE_THREAD") && !std::getenv("PS2_TIME") && ps2::g_options.frames_dir.empty();
     if (!threads) {
@@ -2050,6 +2763,7 @@ int run_window(const std::function<int()> &emulate) {
         return result;
     }
     ps2::g_options.on_vblank = [] {
+        g_weapon_wheel.frame();
         const auto t0 = WaitLog::Clock::now();
         ps2::post_present();
         const auto t1 = WaitLog::Clock::now();

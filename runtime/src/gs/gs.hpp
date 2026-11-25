@@ -84,6 +84,9 @@ struct DisplayOverlay {
 
 struct DisplayRegs {
     std::uint64_t pmode, smode2, dispfb[2], display[2];
+    // Sampled with the registers so the drawing thread presents the same field the EE queued.
+    std::uint64_t frame;
+    bool odd_field;
 };
 DisplayRegs display_regs();
 

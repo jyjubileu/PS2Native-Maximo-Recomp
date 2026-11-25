@@ -1,5 +1,7 @@
 # Publication audit
 
+The [Stage 10D checkpoint](checkpoint-2026-11-22.md#publication-audit) records the current publication scope, including the approved F1 images and the locally prepared SMAA data. The notes below describe the original Stage 4 audit.
+
 ## Source tree
 
 The local tree contains the PS2Native launcher, CMake build, EE and VU translators, the runtime, web sources, upstream disc tools, and synthetic tests. Only original source code under its documented license, text documentation, and synthetic expected results are intended for Git. The [provenance record](provenance.md) identifies the upstream marker, the 19-file local baseline and the sealed Stage 4 arch files.
